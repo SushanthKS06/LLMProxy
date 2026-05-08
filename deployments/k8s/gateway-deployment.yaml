@@ -1,0 +1,64 @@
+# File: deployments/k8s/gateway-deployment.yaml
+# Kubernetes deployment for the gateway
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-gateway
+  labels:
+    app: llm-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llm-gateway
+  template:
+    metadata:
+      labels:
+        app: llm-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: llm-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 9090
+              name: metrics
+          envFrom:
+            - configMapRef:
+                name: llm-gateway-config
+            - secretRef:
+                name: llm-gateway-secrets
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - llm-gateway
+                topologyKey: kubernetes.io/hostname

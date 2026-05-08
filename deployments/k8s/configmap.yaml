@@ -1,0 +1,24 @@
+# File: deployments/k8s/configmap.yaml
+# Kubernetes ConfigMap for non-secret configuration
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-gateway-config
+data:
+  GATEWAY_PORT: "8080"
+  GATEWAY_RATE_LIMIT_RPS: "100"
+  GATEWAY_RATE_LIMIT_BURST: "20"
+  SIMILARITY_THRESHOLD: "0.92"
+  SIMPLE_TOKEN_THRESHOLD: "50"
+  COMPLEX_TOKEN_THRESHOLD: "300"
+  DEFAULT_MODEL: "anthropic/claude-haiku-3"
+  EMBEDDING_MODEL: "text-embedding-3-small"
+  EMBEDDING_BATCH_SIZE: "20"
+  EMBEDDING_BATCH_TIMEOUT_MS: "50"
+  PROMETHEUS_PORT: "9090"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  DASHBOARD_PORT: "8000"
+  POSTGRES_MAX_CONNS: "20"
+  POSTGRES_MIN_CONNS: "2"

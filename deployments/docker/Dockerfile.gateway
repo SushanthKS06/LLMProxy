@@ -1,0 +1,37 @@
+# File: deployments/docker/Dockerfile.gateway
+# Multi-stage build for the Go gateway
+
+# Stage 1: Builder
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git make
+
+# Copy go mod files
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o gateway ./cmd/gateway
+
+# Stage 2: Runner
+FROM gcr.io/distroless/static:nonroot
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /app/gateway .
+
+# Expose ports
+EXPOSE 8080 9090
+
+# Run as non-root
+USER nonroot:nonroot
+
+# Run the gateway
+ENTRYPOINT ["/app/gateway"]
