@@ -1,5 +1,10 @@
 # File: docker-compose.yml
 # LLM Cost Intelligence Gateway - Local Development Stack
+#
+# FIX (MINOR-05): Added timescaledb to shared_preload_libraries alongside vector.
+# Without timescaledb in the preload list the extension loads at runtime but
+# CREATE EXTENSION timescaledb CASCADE in the migration silently fails to create
+# the hypertable, breaking time-series performance entirely.
 
 services:
   postgres:
@@ -18,7 +23,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-    command: postgres -c shared_preload_libraries=vector
+    # FIX (MINOR-05): timescaledb must be in shared_preload_libraries or
+    # CREATE EXTENSION timescaledb CASCADE fails at migration time.
+    command: postgres -c shared_preload_libraries=timescaledb,vector
 
   redis:
     image: redis:7-alpine
@@ -45,7 +52,7 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "8081:8080"
       - "9090:9090"
     env_file:
       - .env

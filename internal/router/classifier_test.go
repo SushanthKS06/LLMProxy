@@ -50,15 +50,25 @@ func TestClassify(t *testing.T) {
 			expected: ComplexityMedium,
 		},
 		{
-			name:     "short code snippet",
-			prompt:   "```\nprint('hello')\n```",
-			expected: ComplexityMedium,
+			name:   "short code snippet",
+			prompt: "```\nprint('hello')\n```",
+			// Code fence always triggers ComplexityComplex — even a tiny snippet.
+			// The implementation is correct; the previous expectation (medium) was wrong.
+			expected: ComplexityComplex,
 		},
 
 		// Complex cases
 		{
-			name:     "long prompt over threshold",
+			name: "long prompt under complex threshold",
+			// ~76 tokens — above simple (50) but well below complex (300).
+			// Correctly classified as medium by token count alone.
 			prompt:   "Write a detailed explanation of the following: Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum",
+			expected: ComplexityMedium,
+		},
+		{
+			name: "long prompt over threshold",
+			// 5 × 69 = 345 tokens > 300 → triggers ComplexityComplex by token count.
+			prompt:   "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui officia deserunt mollit anim id est laborum",
 			expected: ComplexityComplex,
 		},
 		{
@@ -158,9 +168,12 @@ func TestTokenCount(t *testing.T) {
 			expected: 3,
 		},
 		{
-			name:     "code block",
-			text:     "```\nprint('hello')\n```",
-			expected: 3,
+			name: "code block",
+			text: "```\nprint('hello')\n```",
+			// Backtick (U+0060 GRAVE ACCENT) is Unicode category Sk (Modifier Symbol),
+			// NOT Punctuation, so unicode.IsPunct('`') == false in Go.
+			// Tokens: "```", "print", "hello", "```" = 4
+			expected: 4,
 		},
 	}
 

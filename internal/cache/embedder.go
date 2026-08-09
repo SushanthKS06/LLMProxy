@@ -1,17 +1,27 @@
 // File: internal/cache/embedder.go
 // WHY: OpenAI embedding service with async batching to reduce API costs.
 // Batches up to 20 prompts for 50ms before firing a single API call.
+//
+// FIX (BUG-01): duplicate hashText function removed — canonical copy lives
+//   in semantic_cache.go within the same package.
+// FIX (BUG-03): singleflight.Group added to EmbedSingle so that N concurrent
+//   goroutines requesting the same text hash share a single in-flight batch
+//   submission.  Without this, the second goroutine silently overwrites the
+//   first goroutine's result channel in batchResults[hash], causing a 30-second
+//   timeout hang on the orphaned channel.
+// FIX (ISSUE-08): all fmt.Printf error paths replaced with slog.Default().
 
 package cache
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -41,6 +51,7 @@ type Embedder struct {
 	config       *config.EmbeddingsConfig
 	batchCh      chan string
 	batchResults map[string]chan []float32
+	sfGroup      singleflight.Group // FIX (BUG-03): deduplicates concurrent in-flight requests for same text
 	mu           sync.Mutex
 	wg           sync.WaitGroup
 	ctx          context.Context
@@ -49,7 +60,11 @@ type Embedder struct {
 
 // NewEmbedder creates a new Embedder instance.
 func NewEmbedder(cfg *config.Config, redisClient *redis.Client) *Embedder {
-	client := openai.NewClient(cfg.Providers.OpenAIAPIKey)
+	openaiCfg := openai.DefaultConfig(cfg.Providers.OpenAIAPIKey)
+	if cfg.Embeddings.EmbeddingBaseURL != "" {
+		openaiCfg.BaseURL = cfg.Embeddings.EmbeddingBaseURL
+	}
+	client := openai.NewClientWithConfig(openaiCfg)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	e := &Embedder{
@@ -71,41 +86,66 @@ func NewEmbedder(cfg *config.Config, redisClient *redis.Client) *Embedder {
 
 // EmbedSingle generates embedding for a single text.
 // WHY: Checks Redis cache first to avoid re-embedding the same prompt.
+//
+// FIX (BUG-03): singleflight.DoChan ensures that N concurrent calls with the
+// same text hash share one in-flight batch submission.  Each caller gets the
+// same []float32 slice; the context of every caller is honoured via the select.
 func (e *Embedder) EmbedSingle(ctx context.Context, text string) ([]float32, error) {
 	// Check Redis cache first
 	hash := hashText(text)
 	cacheKey := fmt.Sprintf("emb:%s", hash)
 
-	// Try to get from Redis cache
 	cached, err := db.Get(ctx, e.redis, cacheKey)
 	if err == nil && cached != "" {
 		embeddingRequests.WithLabelValues("hit").Inc()
 		return parseEmbedding(cached), nil
 	}
 
-	// Cache miss - generate embedding
 	embeddingRequests.WithLabelValues("miss").Inc()
 
-	// Use batch channel to get embedding
-	resultCh := make(chan []float32, 1)
-	e.mu.Lock()
-	e.batchResults[hash] = resultCh
-	e.mu.Unlock()
+	// DoChan returns a channel that receives the shared result once the
+	// single in-flight function completes (or fails).  Callers that arrive
+	// while another goroutine is already submitting the same hash simply wait
+	// on the shared channel — they never touch batchResults themselves.
+	resCh := e.sfGroup.DoChan(hash, func() (interface{}, error) {
+		resultCh := make(chan []float32, 1)
+		e.mu.Lock()
+		e.batchResults[hash] = resultCh
+		e.mu.Unlock()
 
-	select {
-	case e.batchCh <- text:
-		// Wait for result
 		select {
-		case result := <-resultCh:
-			// Cache the result
-			embStr := serializeEmbedding(result)
-			_ = db.Set(ctx, e.redis, cacheKey, embStr, 24*time.Hour)
-			return result, nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(30 * time.Second):
-			return nil, fmt.Errorf("embedding timeout")
+		case e.batchCh <- text:
+			// Successfully queued; wait for the batch processor to respond.
+			select {
+			case emb := <-resultCh:
+				if emb == nil {
+					return nil, fmt.Errorf("embedding generation failed for hash %s", hash)
+				}
+				// Persist to Redis so the next identical request is a cache hit.
+				embStr := serializeEmbedding(emb)
+				_ = db.Set(context.Background(), e.redis, cacheKey, embStr, 24*time.Hour)
+				return emb, nil
+			case <-time.After(30 * time.Second):
+				return nil, fmt.Errorf("embedding timeout for hash %s", hash)
+			case <-e.ctx.Done():
+				return nil, e.ctx.Err()
+			}
+		case <-e.ctx.Done():
+			return nil, e.ctx.Err()
 		}
+	})
+
+	// Wait for the shared call to complete, respecting the caller's context.
+	select {
+	case res := <-resCh:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		emb, ok := res.Val.([]float32)
+		if !ok || emb == nil {
+			return nil, fmt.Errorf("invalid embedding result type")
+		}
+		return emb, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -123,7 +163,7 @@ func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32,
 
 	// Check cache for each text
 	for i, text := range texts {
-		hash := hashText(texts[i])
+		hash := hashText(text)
 		hashes[i] = hash
 		cacheKey := fmt.Sprintf("emb:%s", hash)
 
@@ -150,7 +190,6 @@ func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32,
 		// Update results and cache
 		for i, idx := range pending {
 			results[idx] = embeddings[i]
-			// Cache the embedding
 			cacheKey := fmt.Sprintf("emb:%s", hashes[idx])
 			embStr := serializeEmbedding(embeddings[i])
 			_ = db.Set(ctx, e.redis, cacheKey, embStr, 24*time.Hour)
@@ -182,7 +221,9 @@ func (e *Embedder) processBatch() {
 		latency := time.Since(start).Milliseconds()
 
 		if err != nil {
-			// Send error to all waiting channels
+			// FIX (ISSUE-08): use slog instead of fmt.Printf
+			slog.Default().Error("embedder: batch OpenAI call failed", "error", err, "batch_size", len(batch))
+			// Signal failure to all waiting channels by closing them (nil = failed).
 			for _, text := range batch {
 				hash := hashText(text)
 				e.mu.Lock()
@@ -193,7 +234,7 @@ func (e *Embedder) processBatch() {
 				e.mu.Unlock()
 			}
 		} else {
-			// Send embeddings to waiting channels
+			// Deliver embeddings to waiting singleflight callers.
 			for i, text := range batch {
 				hash := hashText(text)
 				e.mu.Lock()
@@ -233,7 +274,7 @@ func (e *Embedder) callOpenAI(ctx context.Context, texts []string) ([][]float32,
 	}
 
 	req := openai.EmbeddingRequest{
-		Model: e.config.EmbeddingModel,
+		Model: openai.EmbeddingModel(e.config.EmbeddingModel),
 		Input: texts,
 	}
 
@@ -257,12 +298,6 @@ func (e *Embedder) Close() error {
 	return nil
 }
 
-// hashText generates SHA256 hash of text.
-func hashText(text string) string {
-	h := sha256.Sum256([]byte(text))
-	return hex.EncodeToString(h[:])
-}
-
 // serializeEmbedding converts float32 slice to string for Redis storage.
 func serializeEmbedding(emb []float32) string {
 	result := make([]byte, 0, len(emb)*4)
@@ -270,14 +305,16 @@ func serializeEmbedding(emb []float32) string {
 		bits := math.Float32bits(f)
 		result = append(result, byte(bits>>24), byte(bits>>16), byte(bits>>8), byte(bits))
 	}
-	return hex.EncodeToString(result)
+	return fmt.Sprintf("%x", result)
 }
 
 // parseEmbedding converts stored string back to float32 slice.
 func parseEmbedding(s string) []float32 {
-	data, err := hex.DecodeString(s)
-	if err != nil {
-		return nil
+	data := make([]byte, len(s)/2)
+	for i := 0; i < len(data); i++ {
+		var b byte
+		fmt.Sscanf(s[i*2:i*2+2], "%02x", &b)
+		data[i] = b
 	}
 	result := make([]float32, len(data)/4)
 	for i := 0; i < len(result); i++ {

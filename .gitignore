@@ -51,3 +51,6 @@ temp/
 !cmd/**/*.go
 !internal/**/*.go
 !tests/**/*.go
+
+# Data
+data/

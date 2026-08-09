@@ -15,13 +15,14 @@ import (
 // Config holds all configuration for the gateway.
 // It is immutable after loading - no setters provided.
 type Config struct {
-	Server         ServerConfig
-	Database       DatabaseConfig
-	Embeddings     EmbeddingsConfig
-	Routing        RoutingConfig
-	Providers      ProvidersConfig
-	Cost           map[string]ModelCost
+	Server        ServerConfig
+	Database      DatabaseConfig
+	Embeddings    EmbeddingsConfig
+	Routing       RoutingConfig
+	Providers     ProvidersConfig
+	Cost          map[string]ModelCost
 	Observability ObservabilityConfig
+	Redaction     RedactionConfig
 }
 
 // ServerConfig holds HTTP server configuration.
@@ -34,17 +35,18 @@ type ServerConfig struct {
 
 // DatabaseConfig holds database connection configuration.
 type DatabaseConfig struct {
-	PostgresDSN    string
-	RedisAddr      string
-	RedisPassword  string
-	RedisDB        int
-	MaxConns       int32
-	MinConns       int32
+	PostgresDSN   string
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+	MaxConns      int32
+	MinConns      int32
 }
 
 // EmbeddingsConfig holds embedding service configuration.
 type EmbeddingsConfig struct {
 	OpenAIAPIKey       string
+	EmbeddingBaseURL   string
 	EmbeddingModel     string
 	EmbeddingBatchSize int
 	BatchTimeoutMs     int
@@ -52,9 +54,9 @@ type EmbeddingsConfig struct {
 
 // RoutingConfig holds model routing configuration.
 type RoutingConfig struct {
-	DefaultModel         string
-	SimilarityThreshold  float64
-	SimpleTokenThreshold int
+	DefaultModel          string
+	SimilarityThreshold   float64
+	SimpleTokenThreshold  int
 	ComplexTokenThreshold int
 }
 
@@ -64,6 +66,8 @@ type ProvidersConfig struct {
 	AnthropicBaseURL string
 	AnthropicAPIKey  string
 	OpenAIAPIKey     string
+	GroqBaseURL      string
+	GroqAPIKey       string
 }
 
 // ModelCost holds pricing information for a model.
@@ -77,6 +81,17 @@ type ObservabilityConfig struct {
 	PrometheusPort int
 	LogLevel       string
 	LogFormat      string
+}
+
+// RedactionConfig holds PII redaction settings.
+type RedactionConfig struct {
+	// Enabled is a master switch; set REDACTION_ENABLED=false to bypass entirely.
+	Enabled bool
+	// FailClosed controls whether redaction failures block requests (REDACTION_FAIL_CLOSED=true)
+	// or pass through unredacted (default: false = fail open).
+	FailClosed bool
+	// DisabledPatterns is a list of pattern names to skip (REDACTION_DISABLED_PATTERNS=ipv4,phone_us).
+	DisabledPatterns []string
 }
 
 var (
@@ -98,6 +113,7 @@ func loadConfig() *Config {
 	// Required fields - panic if missing
 	openAIKey := getEnv("OPENAI_API_KEY", "")
 	anthropicKey := getEnv("ANTHROPIC_API_KEY", "")
+	groqKey := getEnv("GROQ_API_KEY", "")
 	postgresDSN := getEnv("POSTGRES_DSN", "")
 	redisAddr := getEnv("REDIS_ADDR", "")
 
@@ -106,6 +122,9 @@ func loadConfig() *Config {
 	}
 	if anthropicKey == "" {
 		panic("ANTHROPIC_API_KEY is required")
+	}
+	if groqKey == "" {
+		panic("GROQ_API_KEY is required")
 	}
 	if postgresDSN == "" {
 		panic("POSTGRES_DSN is required")
@@ -116,10 +135,16 @@ func loadConfig() *Config {
 
 	// Default model costs (USD per 1M tokens)
 	costMap := map[string]ModelCost{
-		"openai/gpt-4o-mini":      {InputPer1M: 0.15, OutputPer1M: 0.60},
-		"openai/gpt-4o":           {InputPer1M: 2.50, OutputPer1M: 10.00},
-		"anthropic/claude-haiku-3": {InputPer1M: 0.25, OutputPer1M: 1.25},
+		"openai/gpt-4o-mini":        {InputPer1M: 0.15, OutputPer1M: 0.60},
+		"openai/gpt-4o":             {InputPer1M: 2.50, OutputPer1M: 10.00},
+		// Anthropic Models
+		"anthropic/claude-haiku-3":  {InputPer1M: 0.25, OutputPer1M: 1.25},
 		"anthropic/claude-sonnet-4": {InputPer1M: 3.00, OutputPer1M: 15.00},
+
+		// Groq Models
+		"groq/gpt-oss-20b":          {InputPer1M: 0.075, OutputPer1M: 0.30},
+		"groq/llama-3.3-70b-versatile": {InputPer1M: 0.59, OutputPer1M: 0.79},
+		"groq/gpt-oss-120b":         {InputPer1M: 0.15, OutputPer1M: 0.60},
 	}
 
 	cfg := &Config{
@@ -139,6 +164,7 @@ func loadConfig() *Config {
 		},
 		Embeddings: EmbeddingsConfig{
 			OpenAIAPIKey:       openAIKey,
+			EmbeddingBaseURL:   getEnv("EMBEDDING_BASE_URL", ""),
 			EmbeddingModel:     getEnv("EMBEDDING_MODEL", "text-embedding-3-small"),
 			EmbeddingBatchSize: getEnvInt("EMBEDDING_BATCH_SIZE", 20),
 			BatchTimeoutMs:     getEnvInt("EMBEDDING_BATCH_TIMEOUT_MS", 50),
@@ -154,12 +180,19 @@ func loadConfig() *Config {
 			AnthropicBaseURL: getEnv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
 			AnthropicAPIKey:  anthropicKey,
 			OpenAIAPIKey:     openAIKey,
+			GroqBaseURL:      getEnv("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+			GroqAPIKey:       groqKey,
 		},
 		Cost: costMap,
 		Observability: ObservabilityConfig{
 			PrometheusPort: getEnvInt("PROMETHEUS_PORT", 9090),
 			LogLevel:       getEnv("LOG_LEVEL", "info"),
 			LogFormat:      getEnv("LOG_FORMAT", "json"),
+		},
+		Redaction: RedactionConfig{
+			Enabled:          getEnvBool("REDACTION_ENABLED", true),
+			FailClosed:       getEnvBool("REDACTION_FAIL_CLOSED", false),
+			DisabledPatterns: getEnvStringSlice("REDACTION_DISABLED_PATTERNS", nil),
 		},
 	}
 
@@ -198,6 +231,31 @@ func getEnvInt32(key string, defaultValue int32) int32 {
 		if intVal, err := strconv.Atoi(value); err == nil {
 			return int32(intVal)
 		}
+	}
+	return defaultValue
+}
+
+// getEnvBool retrieves an environment variable as bool or returns default.
+// Accepts "true", "1", "yes" (case-insensitive) as true; everything else is false.
+func getEnvBool(key string, defaultValue bool) bool {
+	if value, exists := os.LookupEnv(key); exists {
+		v := strings.ToLower(strings.TrimSpace(value))
+		return v == "true" || v == "1" || v == "yes"
+	}
+	return defaultValue
+}
+
+// getEnvStringSlice retrieves a comma-separated env var as a string slice.
+func getEnvStringSlice(key string, defaultValue []string) []string {
+	if value, exists := os.LookupEnv(key); exists && value != "" {
+		parts := strings.Split(value, ",")
+		result := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if t := strings.TrimSpace(p); t != "" {
+				result = append(result, t)
+			}
+		}
+		return result
 	}
 	return defaultValue
 }

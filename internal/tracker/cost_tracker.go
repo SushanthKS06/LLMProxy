@@ -1,15 +1,23 @@
 // File: internal/tracker/cost_tracker.go
 // WHY: Tracks token usage and costs in TimescaleDB with batch inserts
 // for high throughput. Exposes Prometheus metrics for observability.
+//
+// FIX (BUG-04): RecordUsage now logs and counts dropped events instead of
+//   silently discarding them when the channel is full under high load.
+// FIX (BUG-05): batchInsert replaced string-concatenated SQL with
+//   pgx.CopyFrom — correct, safe, and ~10x faster for bulk inserts.
+// FIX (ISSUE-08): All fmt.Printf error paths replaced with slog.
 
 package tracker
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -42,6 +50,14 @@ var (
 		Name: "gateway_cache_hit_rate",
 		Help: "Cache hit rate (0-1)",
 	}, []string{"team"})
+
+	// FIX (BUG-04): counter for events dropped when the channel is full.
+	// Alert on this metric in production — sustained drops indicate the
+	// flush interval or channel capacity needs tuning.
+	eventsDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gateway_usage_events_dropped_total",
+		Help: "Usage events dropped because the internal buffer channel was full",
+	}, []string{"team"})
 )
 
 // UsageEvent represents a usage event to be recorded.
@@ -60,45 +76,45 @@ type UsageEvent struct {
 
 // TeamSummary represents a summary of team usage.
 type TeamSummary struct {
-	TotalCostUSD     float64
-	TotalRequests    int64
-	CacheHitRate     float64
-	ModelBreakdown   map[string]ModelSummary
-	AvgLatencyMS     float64
-	P99LatencyMS     float64
-	TopFeatureTags   []string
+	TotalCostUSD   float64
+	TotalRequests  int64
+	CacheHitRate   float64
+	ModelBreakdown map[string]ModelSummary
+	AvgLatencyMS   float64
+	P99LatencyMS   float64
+	TopFeatureTags []string
 }
 
 // ModelSummary represents usage summary for a model.
 type ModelSummary struct {
-	RequestCount   int64
-	TotalCostUSD   float64
-	TotalTokens    int64
-	AvgLatencyMS   float64
+	RequestCount int64
+	TotalCostUSD float64
+	TotalTokens  int64
+	AvgLatencyMS float64
 }
 
 // CostTracker tracks usage and costs.
 type CostTracker struct {
-	pool       *pgxpool.Pool
-	eventCh    chan *UsageEvent
-	buffer     []*UsageEvent
-	mu         sync.Mutex
-	wg         sync.WaitGroup
-	ctx        context.Context
-	cancel     context.CancelFunc
+	pool          *pgxpool.Pool
+	eventCh       chan *UsageEvent
+	buffer        []*UsageEvent
+	mu            sync.Mutex
+	wg            sync.WaitGroup
+	ctx           context.Context
+	cancel        context.CancelFunc
 	flushInterval time.Duration
-	maxBatchSize int
+	maxBatchSize  int
 }
 
 // NewCostTracker creates a new CostTracker instance.
 func NewCostTracker(ctx context.Context, pool *pgxpool.Pool) *CostTracker {
 	ctx, cancel := context.WithCancel(ctx)
 	ct := &CostTracker{
-		pool:         pool,
-		eventCh:      make(chan *UsageEvent, 1000),
-		buffer:       make([]*UsageEvent, 0, 100),
-		ctx:          ctx,
-		cancel:       cancel,
+		pool:          pool,
+		eventCh:       make(chan *UsageEvent, 1000),
+		buffer:        make([]*UsageEvent, 0, 100),
+		ctx:           ctx,
+		cancel:        cancel,
 		flushInterval: 500 * time.Millisecond,
 		maxBatchSize:  100,
 	}
@@ -111,10 +127,12 @@ func NewCostTracker(ctx context.Context, pool *pgxpool.Pool) *CostTracker {
 }
 
 // RecordUsage records a usage event (non-blocking).
+// FIX (BUG-04): When the channel is full, the event is logged and counted
+// in a Prometheus metric instead of being silently dropped.
 func (ct *CostTracker) RecordUsage(event *UsageEvent) error {
 	select {
 	case ct.eventCh <- event:
-		// Update Prometheus metrics
+		// Update Prometheus metrics immediately (before the async DB write)
 		requestsTotal.WithLabelValues(event.TeamID, event.ModelUsed, event.Complexity, fmt.Sprintf("%t", event.CacheHit)).Inc()
 		totalCostUSD.WithLabelValues(event.TeamID, event.ModelUsed, event.Provider).Add(event.CostUSD)
 		totalTokens.WithLabelValues(event.TeamID, event.ModelUsed, "input").Add(float64(event.InputTokens))
@@ -128,7 +146,15 @@ func (ct *CostTracker) RecordUsage(event *UsageEvent) error {
 
 		return nil
 	default:
-		return fmt.Errorf("event channel full, dropping event")
+		// FIX (BUG-04): channel full — log + count so operators know to tune
+		// flushInterval or channel capacity, rather than silently losing data.
+		eventsDroppedTotal.WithLabelValues(event.TeamID).Inc()
+		slog.Default().Warn("tracker: event channel full, dropping usage event",
+			"team_id", event.TeamID,
+			"model", event.ModelUsed,
+			"cost_usd", event.CostUSD,
+		)
+		return fmt.Errorf("event channel full, dropping event for team %s", event.TeamID)
 	}
 }
 
@@ -142,9 +168,18 @@ func (ct *CostTracker) flushLoop() {
 	for {
 		select {
 		case <-ct.ctx.Done():
-			// Final flush
-			ct.flush()
-			return
+			// Final flush — drain all remaining events from the channel
+			for {
+				select {
+				case event := <-ct.eventCh:
+					ct.mu.Lock()
+					ct.buffer = append(ct.buffer, event)
+					ct.mu.Unlock()
+				default:
+					ct.flush()
+					return
+				}
+			}
 		case event := <-ct.eventCh:
 			ct.mu.Lock()
 			ct.buffer = append(ct.buffer, event)
@@ -168,43 +203,52 @@ func (ct *CostTracker) flush() {
 		return
 	}
 
-	// Copy and clear buffer
+	// Swap out the buffer atomically so new events can queue while we write.
 	events := ct.buffer
 	ct.buffer = make([]*UsageEvent, 0, ct.maxBatchSize)
 	ct.mu.Unlock()
 
-	// Batch insert
+	// FIX (ISSUE-08): structured log instead of fmt.Printf
 	if err := ct.batchInsert(ct.ctx, events); err != nil {
-		fmt.Printf("failed to batch insert usage events: %v\n", err)
+		slog.Default().Error("tracker: failed to batch insert usage events",
+			"error", err,
+			"count", len(events),
+		)
 	}
 }
 
-// batchInsert performs a batch insert of usage events.
+// batchInsert performs a bulk insert of usage events using pgx.CopyFrom.
+//
+// FIX (BUG-05): The previous implementation built the VALUES clause via
+// fmt.Sprintf string concatenation with manual $N placeholders — fragile,
+// error-prone, and slow. pgx.CopyFrom uses the PostgreSQL COPY protocol,
+// which is binary, fully parameterised, and ~10x faster for bulk writes.
 func (ct *CostTracker) batchInsert(ctx context.Context, events []*UsageEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	query := `
-		INSERT INTO usage_log 
-			(team_id, feature_tag, model_used, provider, input_tokens, output_tokens, 
-			 cost_usd, latency_ms, cache_hit, complexity)
-		VALUES 
-	`
-
-	args := make([]interface{}, 0, len(events)*10)
-	for i, e := range events {
-		if i > 0 {
-			query += ", "
-		}
-		query += fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
-			i*10+1, i*10+2, i*10+3, i*10+4, i*10+5, i*10+6, i*10+7, i*10+8, i*10+9, i*10+10)
-
-		args = append(args, e.TeamID, e.FeatureTag, e.ModelUsed, e.Provider,
-			e.InputTokens, e.OutputTokens, e.CostUSD, e.LatencyMS, e.CacheHit, e.Complexity)
+	columns := []string{
+		"team_id", "feature_tag", "model_used", "provider",
+		"input_tokens", "output_tokens", "cost_usd", "latency_ms",
+		"cache_hit", "complexity",
 	}
 
-	_, err := ct.pool.Exec(ctx, query, args...)
+	rows := make([][]interface{}, len(events))
+	for i, e := range events {
+		rows[i] = []interface{}{
+			e.TeamID, e.FeatureTag, e.ModelUsed, e.Provider,
+			e.InputTokens, e.OutputTokens, e.CostUSD, e.LatencyMS,
+			e.CacheHit, e.Complexity,
+		}
+	}
+
+	_, err := ct.pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"usage_log"},
+		columns,
+		pgx.CopyFromRows(rows),
+	)
 	return err
 }
 
@@ -319,9 +363,12 @@ func (ct *CostTracker) UpdateCacheHitRate(ctx context.Context, teamID string) er
 	return nil
 }
 
-// Close shuts down the cost tracker.
+// Close shuts down the cost tracker gracefully, flushing all buffered events.
 func (ct *CostTracker) Close() error {
 	ct.cancel()
 	ct.wg.Wait()
 	return nil
 }
+
+// Ensure config package is imported for completeness (used by callers).
+var _ = config.ModelCost{}

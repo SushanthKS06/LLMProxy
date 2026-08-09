@@ -7,6 +7,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -30,11 +31,11 @@ type RouteDecision struct {
 
 // ProxyRequest represents an incoming proxy request.
 type ProxyRequest struct {
-	Model        string
-	Messages     []Message
-	TeamID       string
-	FeatureTag   string
-	PromptText   string
+	Model      string
+	Messages   []Message
+	TeamID     string
+	FeatureTag string
+	PromptText string
 }
 
 // Message represents a chat message.
@@ -45,17 +46,17 @@ type Message struct {
 
 // ModelRouter handles model routing decisions.
 type ModelRouter struct {
-	config      *config.RoutingConfig
-	costConfig  map[string]config.ModelCost
-	classifier  *ComplexityClassifier
+	config     *config.RoutingConfig
+	costConfig map[string]config.ModelCost
+	classifier *ComplexityClassifier
 }
 
 // NewModelRouter creates a new ModelRouter instance.
 func NewModelRouter(cfg *config.Config) *ModelRouter {
 	return &ModelRouter{
-		config:      &cfg.Routing,
-		costConfig:  cfg.Cost,
-		classifier:  NewComplexityClassifier(cfg.Routing.SimpleTokenThreshold, cfg.Routing.ComplexTokenThreshold),
+		config:     &cfg.Routing,
+		costConfig: cfg.Cost,
+		classifier: NewComplexityClassifier(cfg.Routing.SimpleTokenThreshold, cfg.Routing.ComplexTokenThreshold),
 	}
 }
 
@@ -81,13 +82,13 @@ func (mr *ModelRouter) Route(ctx context.Context, req *ProxyRequest) RouteDecisi
 
 	switch complexity {
 	case ComplexitySimple:
-		model = "openai/gpt-4o-mini"
+		model = "groq/gpt-oss-20b"
 		reason = "simple_prompt"
 	case ComplexityMedium:
-		model = "anthropic/claude-haiku-3"
+		model = "groq/llama-3.3-70b-versatile"
 		reason = "medium_prompt"
 	case ComplexityComplex:
-		model = "anthropic/claude-sonnet-4"
+		model = "groq/gpt-oss-120b"
 		reason = "complex_prompt"
 	default:
 		model = mr.config.DefaultModel
@@ -125,30 +126,19 @@ func (mr *ModelRouter) GetModelCost(model string) (config.ModelCost, bool) {
 	return cost, ok
 }
 
-// getProvider returns the provider for a model.
+// getProvider returns the provider name for a model identifier.
+// Models follow the format "provider/model-name" (e.g. "openai/gpt-4o").
 func getProvider(model string) string {
 	switch {
-	case contains(model, "openai"):
+	case strings.HasPrefix(model, "openai/"):
 		return "openai"
-	case contains(model, "anthropic"):
+	case strings.HasPrefix(model, "anthropic/"):
 		return "anthropic"
+	case strings.HasPrefix(model, "groq/"):
+		return "groq"
 	default:
 		return "unknown"
 	}
-}
-
-// contains checks if s contains substr.
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // GetComplexity returns the complexity classification for a prompt.

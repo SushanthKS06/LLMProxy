@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLMProxy Interface</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <span class="logo-icon">∞</span>
+                    <h1>LLMProxy</h1>
+                </div>
+                <p class="subtitle">Cost Intelligence Gateway</p>
+            </div>
+            
+            <div class="sidebar-stats">
+                <h3>System Status</h3>
+                <div class="stat-box">
+                    <span class="stat-label">API Routing</span>
+                    <span class="stat-value text-green">Online</span>
+                </div>
+                <div class="stat-box">
+                    <span class="stat-label">Cache Server</span>
+                    <span class="stat-value text-green">Online</span>
+                </div>
+            </div>
+
+            <div class="sidebar-footer">
+                <div class="team-badge">
+                    <span class="team-icon">Team:</span>
+                    Engineering
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Chat Area -->
+        <main class="chat-area">
+            <header class="chat-header">
+                <h2>Playground</h2>
+                <div class="header-badges">
+                    <span class="badge badge-outline">PII Redaction Active</span>
+                </div>
+            </header>
+
+            <div class="chat-history" id="chat-history">
+                <!-- Welcome Message -->
+                <div class="message system-message slide-in">
+                    <div class="message-avatar">SYS</div>
+                    <div class="message-content">
+                        <p>Welcome to the LLMProxy Playground. Try sending a prompt to test the Gateway routing and caching features.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Input Area -->
+            <div class="chat-input-wrapper">
+                <form id="chat-form" class="chat-input-container">
+                    <textarea 
+                        id="prompt-input" 
+                        placeholder="Type a message... (e.g. 'calculate 50+50' or 'My email is test@example.com')" 
+                        rows="1"
+                        autofocus
+                    ></textarea>
+                    <button type="submit" id="send-btn" class="send-button" disabled>
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="22" y1="2" x2="11" y2="13"></line>
+                            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                        </svg>
+                    </button>
+                </form>
+                <div class="input-footer">
+                    Secured by LLMProxy Middleware
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Script references -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
