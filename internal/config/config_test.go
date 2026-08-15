@@ -75,46 +75,32 @@ func TestLoadConfig_OverrideViaEnv(t *testing.T) {
 }
 
 func TestLoadConfig_PanicOnMissingRequiredField(t *testing.T) {
+	// FIX (AUDIT-B): config.go panics ONLY on missing GROQ_API_KEY, POSTGRES_DSN,
+	// and REDIS_ADDR. OPENAI_API_KEY and ANTHROPIC_API_KEY are optional — they are
+	// used for embeddings and provider fallback but the gateway routes via Groq by
+	// default. The previous test table incorrectly claimed panics for those keys.
 	tests := []struct {
 		name    string
 		envVars map[string]string
 		missing string
 	}{
 		{
-			name:    "missing OPENAI_API_KEY",
+			name:    "missing GROQ_API_KEY",
 			envVars: map[string]string{},
-			missing: "OPENAI_API_KEY",
-		},
-		{
-			name: "missing ANTHROPIC_API_KEY",
-			envVars: map[string]string{
-				"OPENAI_API_KEY": "sk-test",
-			},
-			missing: "ANTHROPIC_API_KEY",
-		},
-		{
-			name: "missing GROQ_API_KEY",
-			envVars: map[string]string{
-				"OPENAI_API_KEY":    "sk-test",
-				"ANTHROPIC_API_KEY": "sk-ant-test",
-			},
 			missing: "GROQ_API_KEY",
 		},
 		{
 			name: "missing POSTGRES_DSN",
 			envVars: map[string]string{
-				"OPENAI_API_KEY":    "sk-test",
-				"ANTHROPIC_API_KEY": "sk-ant-test",
-				"GROQ_API_KEY":      "sk-groq-test",
+				"GROQ_API_KEY": "sk-groq-test",
 			},
 			missing: "POSTGRES_DSN",
 		},
 		{
 			name: "missing REDIS_ADDR",
 			envVars: map[string]string{
-				"OPENAI_API_KEY":    "sk-test",
-				"ANTHROPIC_API_KEY": "sk-ant-test",
-				"POSTGRES_DSN":      "postgres://test:test@localhost:5432/testdb",
+				"GROQ_API_KEY": "sk-groq-test",
+				"POSTGRES_DSN": "postgres://test:test@localhost:5432/testdb",
 			},
 			missing: "REDIS_ADDR",
 		},
@@ -125,6 +111,7 @@ func TestLoadConfig_PanicOnMissingRequiredField(t *testing.T) {
 			// Clear all required env vars
 			os.Unsetenv("OPENAI_API_KEY")
 			os.Unsetenv("ANTHROPIC_API_KEY")
+			os.Unsetenv("GROQ_API_KEY")
 			os.Unsetenv("POSTGRES_DSN")
 			os.Unsetenv("REDIS_ADDR")
 

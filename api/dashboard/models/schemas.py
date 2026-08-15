@@ -30,7 +30,7 @@ class CostSummary(BaseModel):
     cost_by_model: Dict[str, float]
     cost_by_feature: Dict[str, float]
     cost_by_day: List[CostByDay]
-    savings_from_cache_usd: float
+    total_cost_saved_usd: float
     projected_monthly_cost: float
 
 

@@ -126,9 +126,10 @@ func (mr *ModelRouter) GetModelCost(model string) (config.ModelCost, bool) {
 	return cost, ok
 }
 
-// getProvider returns the provider name for a model identifier.
+// GetProvider returns the provider name for a model identifier.
 // Models follow the format "provider/model-name" (e.g. "openai/gpt-4o").
-func getProvider(model string) string {
+// Exported so other packages (proxy) can reuse it without duplicating the logic.
+func GetProvider(model string) string {
 	switch {
 	case strings.HasPrefix(model, "openai/"):
 		return "openai"
@@ -140,6 +141,9 @@ func getProvider(model string) string {
 		return "unknown"
 	}
 }
+
+// getProvider is the package-private alias kept for internal use.
+func getProvider(model string) string { return GetProvider(model) }
 
 // GetComplexity returns the complexity classification for a prompt.
 func (mr *ModelRouter) GetComplexity(prompt string) ComplexityLevel {

@@ -69,6 +69,7 @@ type UsageEvent struct {
 	InputTokens  int
 	OutputTokens int
 	CostUSD      float64
+	CostSavedUSD float64
 	LatencyMS    int
 	CacheHit     bool
 	Complexity   string
@@ -230,7 +231,7 @@ func (ct *CostTracker) batchInsert(ctx context.Context, events []*UsageEvent) er
 
 	columns := []string{
 		"team_id", "feature_tag", "model_used", "provider",
-		"input_tokens", "output_tokens", "cost_usd", "latency_ms",
+		"input_tokens", "output_tokens", "cost_usd", "cost_saved_usd", "latency_ms",
 		"cache_hit", "complexity",
 	}
 
@@ -238,7 +239,7 @@ func (ct *CostTracker) batchInsert(ctx context.Context, events []*UsageEvent) er
 	for i, e := range events {
 		rows[i] = []interface{}{
 			e.TeamID, e.FeatureTag, e.ModelUsed, e.Provider,
-			e.InputTokens, e.OutputTokens, e.CostUSD, e.LatencyMS,
+			e.InputTokens, e.OutputTokens, e.CostUSD, e.CostSavedUSD, e.LatencyMS,
 			e.CacheHit, e.Complexity,
 		}
 	}

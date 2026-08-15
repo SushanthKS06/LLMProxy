@@ -24,43 +24,95 @@ import (
 )
 
 // RateLimiter implements per-team rate limiting using token bucket.
+// NOTE: This limiter uses an in-memory Go map for token buckets. Under Kubernetes
+// HPA, running N replicas means the effective per-team rate limit becomes configured_rps * N.
+// It is not cluster-safe and should be replaced with a Redis-backed limiter if exact
+// global limits are required across multiple replicas.
+//
+// FIX (P2-7): Added lastSeen timestamps and a background cleanup goroutine to evict
+// stale entries. Without eviction an attacker sending requests with random X-Gateway-Team
+// headers would exhaust gateway memory.
+// FIX (AUDIT-D): ctx plumbed into cleanupLoop so the goroutine stops on shutdown.
 type RateLimiter struct {
-	limiters map[string]*rate.Limiter
+	limiters map[string]*rateLimiterEntry
 	mu       sync.RWMutex
 	rps      int
 	burst    int
 }
 
-// NewRateLimiter creates a new RateLimiter.
-func NewRateLimiter(rps, burst int) *RateLimiter {
-	return &RateLimiter{
-		limiters: make(map[string]*rate.Limiter),
+// rateLimiterEntry pairs a token-bucket limiter with its last-access time for eviction.
+type rateLimiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+// NewRateLimiter creates a new RateLimiter and starts a background goroutine
+// that evicts limiter entries not seen in the last 5 minutes.
+// FIX (P2-7): Without eviction, arbitrary X-Gateway-Team values exhaust memory.
+// FIX (AUDIT-D): ctx is plumbed into cleanupLoop so the goroutine exits cleanly
+// during graceful shutdown instead of leaking indefinitely.
+func NewRateLimiter(ctx context.Context, rps, burst int) *RateLimiter {
+	rl := &RateLimiter{
+		limiters: make(map[string]*rateLimiterEntry),
 		rps:      rps,
 		burst:    burst,
+	}
+	go rl.cleanupLoop(ctx)
+	return rl
+}
+
+// cleanupLoop evicts limiter entries that haven't been seen in 5 minutes.
+// FIX (AUDIT-D): ctx.Done() case ensures the goroutine exits on server shutdown
+// instead of leaking forever.
+func (rl *RateLimiter) cleanupLoop(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-5 * time.Minute)
+			rl.mu.Lock()
+			for team, entry := range rl.limiters {
+				if entry.lastSeen.Before(cutoff) {
+					delete(rl.limiters, team)
+				}
+			}
+			rl.mu.Unlock()
+		}
 	}
 }
 
 // getLimiter gets or creates a rate limiter for a team.
 func (rl *RateLimiter) getLimiter(teamID string) *rate.Limiter {
 	rl.mu.RLock()
-	limiter, exists := rl.limiters[teamID]
+	entry, exists := rl.limiters[teamID]
 	rl.mu.RUnlock()
 
 	if exists {
-		return limiter
+		// Update lastSeen under write lock to avoid torn writes.
+		rl.mu.Lock()
+		entry.lastSeen = time.Now()
+		rl.mu.Unlock()
+		return entry.limiter
 	}
 
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
 	// Double-check after acquiring write lock
-	if limiter, exists = rl.limiters[teamID]; exists {
-		return limiter
+	if entry, exists = rl.limiters[teamID]; exists {
+		entry.lastSeen = time.Now()
+		return entry.limiter
 	}
 
-	limiter = rate.NewLimiter(rate.Limit(rl.rps), rl.burst)
-	rl.limiters[teamID] = limiter
-	return limiter
+	newEntry := &rateLimiterEntry{
+		limiter:  rate.NewLimiter(rate.Limit(rl.rps), rl.burst),
+		lastSeen: time.Now(),
+	}
+	rl.limiters[teamID] = newEntry
+	return newEntry.limiter
 }
 
 // Limit returns a middleware that rate limits by team.
@@ -94,9 +146,21 @@ func NewRequestLogger(logger *slog.Logger) *RequestLogger {
 }
 
 // Log returns a middleware that logs requests.
+// FIX (P1-3): Request ID is now injected into the request context so every
+// downstream log line can include it as a structured field for correlation.
 func (rl *RequestLogger) Log(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+
+		// Generate or accept request ID BEFORE handler runs so it
+		// can be propagated into context for downstream log calls.
+		reqID := r.Header.Get("X-Request-ID")
+		if reqID == "" {
+			reqID = uuid.New().String()
+		}
+		// Propagate into context so handler-level logs can include it.
+		ctx := context.WithValue(r.Context(), contextKeyRequestID{}, reqID)
+		r = r.WithContext(ctx)
 
 		// Wrap response writer to capture status code
 		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
@@ -115,12 +179,12 @@ func (rl *RequestLogger) Log(next http.Handler) http.Handler {
 			featureTag = "untagged"
 		}
 
-		reqID := r.Header.Get("X-Request-ID")
-		if reqID == "" {
-			reqID = uuid.New().String()
-		}
+		// Echo the request ID back in the response header.
 		w.Header().Set("X-Request-ID", reqID)
 
+		// FIX (AUDIT-C): X-Gateway-Model and X-Gateway-Cache are RESPONSE headers
+		// set by the handler on the ResponseWriter. Reading them from r.Header
+		// (the request) always returned "". Read from wrapped.Header() instead.
 		rl.logger.Info("request",
 			"time", start.Format(time.RFC3339),
 			"request_id", reqID,
@@ -128,12 +192,23 @@ func (rl *RequestLogger) Log(next http.Handler) http.Handler {
 			"path", r.URL.Path,
 			"team_id", teamID,
 			"feature_tag", featureTag,
-			"model", r.Header.Get("X-Gateway-Model"),
-			"cache_hit", r.Header.Get("X-Gateway-Cache"),
+			"model", wrapped.Header().Get("X-Gateway-Model"),
+			"cache_hit", wrapped.Header().Get("X-Gateway-Cache"),
 			"latency_ms", latency,
 			"status_code", wrapped.statusCode,
 		)
 	})
+}
+
+// contextKeyRequestID is the context key for the request ID value.
+type contextKeyRequestID struct{}
+
+// RequestIDFromContext returns the request ID stored in the context, or "" if absent.
+func RequestIDFromContext(ctx context.Context) string {
+	if v := ctx.Value(contextKeyRequestID{}); v != nil {
+		return v.(string)
+	}
+	return ""
 }
 
 type responseWriter struct {
@@ -185,30 +260,49 @@ type CORSMiddleware struct {
 	allowedHeaders []string
 }
 
-// NewCORSMiddleware creates a new CORSMiddleware.
+// NewCORSMiddleware creates a new CORSMiddleware with a permissive wildcard origin.
+// For production use, prefer NewCORSMiddlewareWithOrigins to restrict to known origins.
 func NewCORSMiddleware() *CORSMiddleware {
+	return NewCORSMiddlewareWithOrigins([]string{"*"})
+}
+
+// NewCORSMiddlewareWithOrigins creates a CORSMiddleware that only allows requests
+// from the specified origin list. Use this in production to prevent arbitrary
+// websites from making credentialed cross-origin requests to the gateway.
+// FIX (AUDIT-J): The previous implementation always used "*" even though the fix
+// comment claimed configurable origins. This constructor enables real configuration.
+func NewCORSMiddlewareWithOrigins(origins []string) *CORSMiddleware {
 	return &CORSMiddleware{
-		allowedOrigins: []string{"*"},
+		allowedOrigins: origins,
 		allowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		allowedHeaders: []string{"Content-Type", "Authorization", "X-Gateway-Team", "X-Gateway-Feature", "X-Gateway-Model", "X-Gateway-API-Key"},
 	}
 }
 
 // CORS returns a middleware that handles CORS.
+// FIX (P1-2): Non-preflight responses now use the configured allowedOrigins list
+// instead of the hardcoded wildcard "*". This prevents any website from making
+// cross-origin requests to a gateway that holds API keys and cost data.
 func (cm *CORSMiddleware) CORS(next http.Handler) http.Handler {
+	// Pre-join the values once so we don't allocate on every request.
+	originsValue := strings.Join(cm.allowedOrigins, ",")
+	methodsValue := strings.Join(cm.allowedMethods, ",")
+	headersValue := strings.Join(cm.allowedHeaders, ",")
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "OPTIONS" {
-			w.Header().Set("Access-Control-Allow-Origin", strings.Join(cm.allowedOrigins, ","))
-			w.Header().Set("Access-Control-Allow-Methods", strings.Join(cm.allowedMethods, ","))
-			w.Header().Set("Access-Control-Allow-Headers", strings.Join(cm.allowedHeaders, ","))
-			w.Header().Set("Access-Control-Expose-Headers", "X-Gateway-Cache, X-Gateway-Model")
+			w.Header().Set("Access-Control-Allow-Origin", originsValue)
+			w.Header().Set("Access-Control-Allow-Methods", methodsValue)
+			w.Header().Set("Access-Control-Allow-Headers", headersValue)
+			w.Header().Set("Access-Control-Expose-Headers", "X-Gateway-Cache, X-Gateway-Model, X-Gateway-Cost-USD, X-Gateway-Latency-MS, X-Request-ID")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Expose-Headers", "X-Gateway-Cache, X-Gateway-Model")
+		// FIX (P1-2): Use the configured origins, not a hardcoded wildcard.
+		w.Header().Set("Access-Control-Allow-Origin", originsValue)
+		w.Header().Set("Access-Control-Expose-Headers", "X-Gateway-Cache, X-Gateway-Model, X-Gateway-Cost-USD, X-Gateway-Latency-MS, X-Request-ID")
 
 		next.ServeHTTP(w, r)
 	})
@@ -236,6 +330,10 @@ func NewAuthMiddleware(apiKeys []string, logger *slog.Logger) *AuthMiddleware {
 // WHY: When GATEWAY_API_KEYS is not set, the gateway runs in open mode (no auth).
 // This allows local development without configuring keys. In production, always
 // set GATEWAY_API_KEYS to a non-empty value.
+//
+// FIX (P1-1): Removed query-parameter fallback for API keys. URL query parameters
+// appear in server access logs, browser history, Nginx/proxy logs, CDN logs, and
+// Referer headers — all unencrypted channels. API keys must only be passed in headers.
 func (am *AuthMiddleware) Auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip auth for health check
@@ -251,10 +349,6 @@ func (am *AuthMiddleware) Auth(next http.Handler) http.Handler {
 		}
 
 		apiKey := r.Header.Get("X-Gateway-API-Key")
-		if apiKey == "" {
-			// Check query parameter as fallback
-			apiKey = r.URL.Query().Get("api_key")
-		}
 
 		if apiKey == "" || !am.validKeys[apiKey] {
 			if apiKey != "" {

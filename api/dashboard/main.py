@@ -2,13 +2,25 @@
 # FastAPI Dashboard Application
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import get_settings
 from database import engine, Base
 from routes import costs, cache, models, latency, health
 
+
+async def verify_api_key(x_dashboard_api_key: str = Header(None)):
+    settings = get_settings()
+    if not settings.dashboard_api_keys:
+        return # Open mode
+
+    valid_keys = [k.strip() for k in settings.dashboard_api_keys.split(",") if k.strip()]
+    if not valid_keys:
+        return
+        
+    if not x_dashboard_api_key or x_dashboard_api_key not in valid_keys:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,12 +48,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routes
+# Register routes (apply auth dependency to all except health)
 app.include_router(health.router)
-app.include_router(costs.router)
-app.include_router(cache.router)
-app.include_router(models.router)
-app.include_router(latency.router)
+app.include_router(costs.router, dependencies=[Depends(verify_api_key)])
+app.include_router(cache.router, dependencies=[Depends(verify_api_key)])
+app.include_router(models.router, dependencies=[Depends(verify_api_key)])
+app.include_router(latency.router, dependencies=[Depends(verify_api_key)])
 
 
 @app.get("/")

@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     # Observability
     log_level: str = "info"
     
+    # Auth
+    dashboard_api_keys: str = ""
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

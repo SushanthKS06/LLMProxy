@@ -65,27 +65,37 @@ func main() {
 // migrateUp reads and executes the initial schema SQL via the pgx pool.
 // All DDL uses IF NOT EXISTS so running multiple times is safe.
 func migrateUp(ctx context.Context, pool *pgxpool.Pool) error {
-	paths := []string{
-		"internal/db/migrations/001_initial.sql",
-		"/app/internal/db/migrations/001_initial.sql",
+	files := []string{
+		"001_initial.sql",
+		"002_add_cost_saved.sql",
 	}
 
-	var sqlBytes []byte
-	var readErr error
-	for _, p := range paths {
-		sqlBytes, readErr = os.ReadFile(p)
-		if readErr == nil {
-			fmt.Printf("  applying: %s\n", p)
-			break
+	prefixes := []string{
+		"internal/db/migrations/",
+		"/app/internal/db/migrations/",
+	}
+
+	for _, file := range files {
+		var sqlBytes []byte
+		var readErr error
+		var applied bool
+
+		for _, prefix := range prefixes {
+			p := prefix + file
+			sqlBytes, readErr = os.ReadFile(p)
+			if readErr == nil {
+				fmt.Printf("  applying: %s\n", p)
+				if _, err := pool.Exec(ctx, string(sqlBytes)); err != nil {
+					fmt.Printf("  warning: %v\n  (safe to ignore if schema already exists)\n", err)
+				}
+				applied = true
+				break
+			}
 		}
-	}
-	if readErr != nil {
-		return fmt.Errorf("migration file not found (tried %v): %w", paths, readErr)
-	}
 
-	if _, err := pool.Exec(ctx, string(sqlBytes)); err != nil {
-		// Non-fatal: may warn on timescaledb hypertable re-creation
-		fmt.Printf("  warning: %v\n  (safe to ignore if schema already exists)\n", err)
+		if !applied {
+			return fmt.Errorf("migration file %s not found in any prefix", file)
+		}
 	}
 
 	return nil

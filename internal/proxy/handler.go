@@ -142,6 +142,16 @@ func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		FeatureTag: featureTag,
 	})
 
+	// Validate model override against known models to prevent forwarding to unknown providers.
+	// P2-5: An unrecognized model causes forwardToProvider to return (nil, 0, err),
+	// and without this check the nil response would panic at response.Body.Close().
+	if modelOverride != "" {
+		if err := h.router.ValidateModel(modelOverride); err != nil {
+			h.writeError(w, r, http.StatusBadRequest, fmt.Sprintf("invalid model: %v", err))
+			return
+		}
+	}
+
 	// ── Forward to LLM provider ──────────────────────────────────────────────
 	response, providerLatency, err := h.forwardToProvider(ctx, r, &reqBody, routeDecision.Model, routeDecision.Provider)
 	if err != nil {
@@ -149,14 +159,17 @@ func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, http.StatusBadGateway, fmt.Sprintf("provider error: %v", err))
 		return
 	}
+	// FIX (P0-1): defer response.Body.Close() MUST come after the nil check above.
+	// If forwardToProvider returns (nil, 0, err), calling response.Body.Close() panics.
 	defer response.Body.Close()
 
 	// ── Respond to client ────────────────────────────────────────────────────
 	// FIX (BUG-07): capture the actual status code written to the client so
 	// the proxyRequests metric is accurate for non-200 provider responses.
 	if reqBody.Stream {
-		h.handleStreaming(w, r, response, routeDecision.Model, teamID, featureTag, promptText, providerLatency, start)
-		proxyRequests.WithLabelValues(r.Method, "200").Inc()
+		// FIX (P2-2): pass response to get actual provider status code for the metric.
+		statusCode := h.handleStreaming(w, r, response, routeDecision.Model, teamID, featureTag, promptText, providerLatency, start)
+		proxyRequests.WithLabelValues(r.Method, fmt.Sprintf("%d", statusCode)).Inc()
 	} else {
 		statusCode := h.handleNonStreaming(w, r, response, routeDecision.Model, teamID, featureTag, providerLatency, start, promptText)
 		proxyRequests.WithLabelValues(r.Method, fmt.Sprintf("%d", statusCode)).Inc()
@@ -189,7 +202,8 @@ func (h *GatewayHandler) handleCacheHit(w http.ResponseWriter, r *http.Request, 
 		Provider:     getProviderFromModel(result.ModelUsed),
 		InputTokens:  0, // Not re-charged for cache hits
 		OutputTokens: 0,
-		CostUSD:      result.CostUSD,
+		CostUSD:      0, // Nothing was billed to Groq
+		CostSavedUSD: result.CostUSD, // What it would have cost
 		LatencyMS:    int(latency),
 		CacheHit:     true,
 		Complexity:   string(h.router.GetComplexity(promptText)), // use original prompt, not response JSON
@@ -199,7 +213,8 @@ func (h *GatewayHandler) handleCacheHit(w http.ResponseWriter, r *http.Request, 
 // handleStreaming forwards a streaming SSE response to the client chunk-by-chunk.
 // Cost is reported as an HTTP trailer (sent after body) so we can compute
 // the actual token count from the full streamed response before setting it.
-func (h *GatewayHandler) handleStreaming(w http.ResponseWriter, r *http.Request, response *http.Response, model, teamID, featureTag, promptText string, providerLatency int, start time.Time) {
+// FIX (P2-2): Returns the actual HTTP status code from the provider (used for metrics).
+func (h *GatewayHandler) handleStreaming(w http.ResponseWriter, r *http.Request, response *http.Response, model, teamID, featureTag, promptText string, providerLatency int, start time.Time) int {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Gateway-Cache", "miss")
@@ -211,7 +226,7 @@ func (h *GatewayHandler) handleStreaming(w http.ResponseWriter, r *http.Request,
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.writeError(w, r, http.StatusInternalServerError, "streaming not supported")
-		return
+		return http.StatusInternalServerError
 	}
 
 	buf := make([]byte, 4096)
@@ -240,6 +255,12 @@ func (h *GatewayHandler) handleStreaming(w http.ResponseWriter, r *http.Request,
 	// Clients that don't support trailers simply ignore this header.
 	w.Header().Set(http.TrailerPrefix+"X-Gateway-Cost-USD", fmt.Sprintf("%.8f", cost))
 
+	// Async: store response in semantic cache for future similar prompts.
+	// Only cache successful provider responses (2xx).
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		h.storeInCache(promptText, fullResponse.String(), model, teamID, inputTokens, outputTokens, cost)
+	}
+
 	h.tracker.RecordUsage(&tracker.UsageEvent{
 		TeamID:       teamID,
 		FeatureTag:   featureTag,
@@ -248,10 +269,15 @@ func (h *GatewayHandler) handleStreaming(w http.ResponseWriter, r *http.Request,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		CostUSD:      cost,
+		CostSavedUSD: 0,
 		LatencyMS:    int(latency),
 		CacheHit:     false,
 		Complexity:   string(h.router.GetComplexity(promptText)),
 	})
+
+	// FIX (P2-2): return the actual provider status so the caller records the
+	// correct metric label instead of always recording "200".
+	return response.StatusCode
 }
 
 // handleNonStreaming reads the full provider response, sends it to the client,
@@ -294,6 +320,7 @@ func (h *GatewayHandler) handleNonStreaming(w http.ResponseWriter, r *http.Reque
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		CostUSD:      cost,
+		CostSavedUSD: 0,
 		LatencyMS:    int(latency),
 		CacheHit:     false,
 		Complexity:   string(h.router.GetComplexity(promptText)),
@@ -366,7 +393,15 @@ func (h *GatewayHandler) forwardToProvider(ctx context.Context, r *http.Request,
 			resp.Body.Close()
 		}
 
-		time.Sleep(backoff)
+		// FIX (AUDIT-E): time.Sleep is not context-aware. If the client disconnects
+		// during the backoff window, the goroutine was blocked for the full backoff
+		// duration. Replace with a context-aware select so we return immediately
+		// when the client cancels or the server shuts down.
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		}
 		backoff *= 2
 	}
 	latency := int(time.Since(start).Milliseconds())
@@ -457,18 +492,10 @@ func extractPromptTextFromJSON(resp string) string {
 }
 
 // getProviderFromModel returns the provider name from an internal model identifier.
-// Internal format: "provider/model-name" (e.g. "openai/gpt-4o-mini").
+// FIX (P3-2): Delegated to router.GetProvider to eliminate the duplicate
+// implementation that was previously kept in sync manually.
 func getProviderFromModel(model string) string {
-	switch {
-	case strings.HasPrefix(model, "openai/"):
-		return "openai"
-	case strings.HasPrefix(model, "anthropic/"):
-		return "anthropic"
-	case strings.HasPrefix(model, "groq/"):
-		return "groq"
-	default:
-		return "unknown"
-	}
+	return router.GetProvider(model)
 }
 
 // estimateTokensFromPrompt estimates tokens in a user prompt using a character heuristic.
@@ -499,11 +526,14 @@ func convertToProviderFormat(req *chatCompletionRequest, provider, model string)
 }
 
 // mapGroqModelName converts internal model identifiers to Groq API model IDs.
+// FIX (P0-3): Previous mapping incorrectly set "openai/gpt-oss-20b" as the Groq
+// model ID, which caused Groq to return HTTP 400 "unknown model" on every simple
+// prompt. Groq API expects bare model names without a provider prefix.
 func mapGroqModelName(model string) string {
 	mapping := map[string]string{
-		"groq/gpt-oss-20b":             "openai/gpt-oss-20b",
+		"groq/gpt-oss-20b":             "gpt-oss-20b",
 		"groq/llama-3.3-70b-versatile": "llama-3.3-70b-versatile",
-		"groq/gpt-oss-120b":            "openai/gpt-oss-120b",
+		"groq/gpt-oss-120b":            "gpt-oss-120b",
 	}
 	if mapped, ok := mapping[model]; ok {
 		return mapped
