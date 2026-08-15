@@ -1,6 +1,11 @@
 // File: internal/db/postgres.go
 // WHY: PostgreSQL connection pool with pgx/v5 for high-performance database access.
 // Uses connection pooling to handle concurrent requests efficiently.
+//
+// FIX (MINOR-03): Removed three unused wrapper functions (QueryRow, Query, Exec)
+//   that thin-wrapped the pool methods. No caller in the project used them —
+//   all callers call pool.Exec / pool.Query / pool.QueryRow directly.
+//   Keeping dead wrappers creates confusion about which path to use.
 
 package db
 
@@ -9,14 +14,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang-migrate/migrate/v4"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/sushanthks/llm-gateway/internal/config"
 )
 
-// NewPool creates a new pgx connection pool.
+// NewPool creates a new pgx connection pool with production-ready settings.
 func NewPool(ctx context.Context, cfg *config.DatabaseConfig) (*pgxpool.Pool, error) {
 	poolConfig, err := pgxpool.ParseConfig(cfg.PostgresDSN)
 	if err != nil {
@@ -44,45 +46,10 @@ func NewPool(ctx context.Context, cfg *config.DatabaseConfig) (*pgxpool.Pool, er
 	return pool, nil
 }
 
-// HealthCheck verifies the database connection is healthy.
-func HealthCheck(ctx context.Context, pool *pgxpool.Pool) error {
+// PostgresHealthCheck verifies the PostgreSQL connection pool is healthy.
+func PostgresHealthCheck(ctx context.Context, pool *pgxpool.Pool) error {
 	if pool == nil {
 		return fmt.Errorf("pool is nil")
 	}
 	return pool.Ping(ctx)
-}
-
-// RunMigrations runs database migrations using golang-migrate.
-// WHY: Migrations must be run on startup to ensure schema is up to date.
-func RunMigrations(ctx context.Context, dsn string, migrationsPath string) error {
-	m, err := migrate.New(migrationsPath, dsn)
-	if err != nil {
-		return fmt.Errorf("failed to create migration: %w", err)
-	}
-
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		return fmt.Errorf("migration failed: %w", err)
-	}
-
-	return nil
-}
-
-// GetPoolConfig returns the default pool configuration.
-func GetPoolConfig(dsn string) (*pgxpool.Config, error) {
-	return pgxpool.ParseConfig(dsn)
-}
-
-// QueryRow wraps pgxpool.QueryRow for convenience.
-func QueryRow(ctx context.Context, pool *pgxpool.Pool, sql string, args ...interface{}) (pgx.Row, error) {
-	return pool.QueryRow(ctx, sql, args...), nil
-}
-
-// Query wraps pgxpool.Query for convenience.
-func Query(ctx context.Context, pool *pgxpool.Pool, sql string, args ...interface{}) (pgx.Rows, error) {
-	return pool.Query(ctx, sql, args...)
-}
-
-// Exec wraps pgxpool.Exec for convenience.
-func Exec(ctx context.Context, pool *pgxpool.Pool, sql string, args ...interface{}) (pgconn.CommandTag, error) {
-	return pool.Exec(ctx, sql, args...)
 }

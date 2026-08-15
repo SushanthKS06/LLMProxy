@@ -13,9 +13,9 @@ import (
 type ComplexityLevel string
 
 const (
-	ComplexitySimple   ComplexityLevel = "simple"
-	ComplexityMedium   ComplexityLevel = "medium"
-	ComplexityComplex  ComplexityLevel = "complex"
+	ComplexitySimple  ComplexityLevel = "simple"
+	ComplexityMedium  ComplexityLevel = "medium"
+	ComplexityComplex ComplexityLevel = "complex"
 )
 
 // ComplexityClassifier classifies prompts by complexity.
@@ -31,7 +31,7 @@ func NewComplexityClassifier(simpleThreshold, complexThreshold int) *ComplexityC
 		simpleTokenThreshold:  simpleThreshold,
 		complexTokenThreshold: complexThreshold,
 		complexKeywords: []string{
-			"analyze", "compare", "synthesize", "explain why", "step by step",
+			"analyze", "compare", "synthesize", "explain why", "explain", "step by step",
 			"walk me through", "evaluate", "contrast", "pros and cons",
 			"what are the implications", "critique", "debug", "and then", "after that",
 		},
@@ -74,13 +74,23 @@ func containsCodeFence(text string) bool {
 	return strings.Contains(text, "```")
 }
 
-// countComplexKeywords counts how many complex keywords are in the text.
+// countComplexKeywords counts the total number of complex-keyword occurrences in text.
+// WHY: We count occurrences, not unique keyword presence.
+// Example: "Analyze X and analyze Y" scores 2 (complex), not 1 (medium).
+// This prevents prompts that repeat analytical intent from being under-classified.
 func (c *ComplexityClassifier) countComplexKeywords(text string) int {
 	lowerText := strings.ToLower(text)
 	count := 0
 	for _, keyword := range c.complexKeywords {
-		if strings.Contains(lowerText, keyword) {
+		// Count every occurrence of this keyword in the text.
+		remaining := lowerText
+		for {
+			idx := strings.Index(remaining, keyword)
+			if idx < 0 {
+				break
+			}
 			count++
+			remaining = remaining[idx+len(keyword):]
 		}
 	}
 	return count

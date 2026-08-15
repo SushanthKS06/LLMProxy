@@ -4,40 +4,50 @@ package config
 
 import (
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestLoadConfig_Defaults(t *testing.T) {
-	// Save original env
-	origEnv := os.environ
-	os.environ = &mockEnv{}
-	defer func() { os.environ = origEnv }()
-
-	// Clear singleton for test
+// resetSingleton clears the package-level singleton so each test gets a fresh Load().
+// WHY: config uses sync.Once, so without resetting it every test would re-use
+// the first call's result.  This is safe in tests since they run sequentially
+// within the package (go test -count=1).
+func resetSingleton() {
 	cfg = nil
 	once = sync.Once{}
+}
 
-	// Set required env vars
-	os.Setenv("OPENAI_API_KEY", "sk-test")
-	os.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-	os.Setenv("POSTGRES_DSN", "postgres://test:test@localhost:5432/testdb")
-	os.Setenv("REDIS_ADDR", "localhost:6379")
-	defer os.Unsetenv("OPENAI_API_KEY")
-	defer os.Unsetenv("ANTHROPIC_API_KEY")
-	defer os.Unsetenv("POSTGRES_DSN")
-	defer os.Unsetenv("REDIS_ADDR")
+// setRequiredEnv sets the four mandatory env vars and returns a cleanup func.
+func setRequiredEnv(t *testing.T, extra ...string) {
+	t.Helper()
+	required := []string{
+		"OPENAI_API_KEY", "sk-test",
+		"ANTHROPIC_API_KEY", "sk-ant-test",
+		"GROQ_API_KEY", "sk-groq-test",
+		"POSTGRES_DSN", "postgres://test:test@localhost:5432/testdb",
+		"REDIS_ADDR", "localhost:6379",
+	}
+	all := append(required, extra...)
+	for i := 0; i < len(all)-1; i += 2 {
+		os.Setenv(all[i], all[i+1])
+	}
+	t.Cleanup(func() {
+		for i := 0; i < len(all)-1; i += 2 {
+			os.Unsetenv(all[i])
+		}
+	})
+}
 
-	// Reset sync.Once
-	once = sync.Once{}
+func TestLoadConfig_Defaults(t *testing.T) {
+	resetSingleton()
+	setRequiredEnv(t)
 
 	cfg = Load()
 
 	require.NotNil(t, cfg, "config should not be nil")
-
-	// Verify defaults
 	assert.Equal(t, 8080, cfg.Server.Port, "default port should be 8080")
 	assert.Equal(t, "text-embedding-3-small", cfg.Embeddings.EmbeddingModel, "default embedding model")
 	assert.Equal(t, 0.92, cfg.Routing.SimilarityThreshold, "default similarity threshold")
@@ -49,30 +59,12 @@ func TestLoadConfig_Defaults(t *testing.T) {
 }
 
 func TestLoadConfig_OverrideViaEnv(t *testing.T) {
-	// Save original env
-	origEnv := os.environ
-	os.environ = &mockEnv{}
-	defer func() { os.environ = origEnv }()
-
-	// Set required env vars with overrides
-	os.Setenv("OPENAI_API_KEY", "sk-test")
-	os.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-	os.Setenv("POSTGRES_DSN", "postgres://test:test@localhost:5432/testdb")
-	os.Setenv("REDIS_ADDR", "localhost:6379")
-	os.Setenv("GATEWAY_PORT", "9090")
-	os.Setenv("SIMILARITY_THRESHOLD", "0.95")
-	os.Setenv("LOG_LEVEL", "debug")
-	defer os.Unsetenv("OPENAI_API_KEY")
-	defer os.Unsetenv("ANTHROPIC_API_KEY")
-	defer os.Unsetenv("POSTGRES_DSN")
-	defer os.Unsetenv("REDIS_ADDR")
-	defer os.Unsetenv("GATEWAY_PORT")
-	defer os.Unsetenv("SIMILARITY_THRESHOLD")
-	defer os.Unsetenv("LOG_LEVEL")
-
-	// Reset singleton
-	cfg = nil
-	once = sync.Once{}
+	resetSingleton()
+	setRequiredEnv(t,
+		"GATEWAY_PORT", "9090",
+		"SIMILARITY_THRESHOLD", "0.95",
+		"LOG_LEVEL", "debug",
+	)
 
 	cfg = Load()
 
@@ -101,19 +93,28 @@ func TestLoadConfig_PanicOnMissingRequiredField(t *testing.T) {
 			missing: "ANTHROPIC_API_KEY",
 		},
 		{
+			name: "missing GROQ_API_KEY",
+			envVars: map[string]string{
+				"OPENAI_API_KEY":    "sk-test",
+				"ANTHROPIC_API_KEY": "sk-ant-test",
+			},
+			missing: "GROQ_API_KEY",
+		},
+		{
 			name: "missing POSTGRES_DSN",
 			envVars: map[string]string{
-				"OPENAI_API_KEY":  "sk-test",
+				"OPENAI_API_KEY":    "sk-test",
 				"ANTHROPIC_API_KEY": "sk-ant-test",
+				"GROQ_API_KEY":      "sk-groq-test",
 			},
 			missing: "POSTGRES_DSN",
 		},
 		{
 			name: "missing REDIS_ADDR",
 			envVars: map[string]string{
-				"OPENAI_API_KEY":  "sk-test",
+				"OPENAI_API_KEY":    "sk-test",
 				"ANTHROPIC_API_KEY": "sk-ant-test",
-				"POSTGRES_DSN":    "postgres://test:test@localhost:5432/testdb",
+				"POSTGRES_DSN":      "postgres://test:test@localhost:5432/testdb",
 			},
 			missing: "REDIS_ADDR",
 		},
@@ -121,13 +122,13 @@ func TestLoadConfig_PanicOnMissingRequiredField(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Clear env
+			// Clear all required env vars
 			os.Unsetenv("OPENAI_API_KEY")
 			os.Unsetenv("ANTHROPIC_API_KEY")
 			os.Unsetenv("POSTGRES_DSN")
 			os.Unsetenv("REDIS_ADDR")
 
-			// Set test env vars
+			// Set only the ones in the test case
 			for k, v := range tt.envVars {
 				os.Setenv(k, v)
 			}
@@ -137,11 +138,9 @@ func TestLoadConfig_PanicOnMissingRequiredField(t *testing.T) {
 				}
 			}()
 
-			// Reset singleton
-			cfg = nil
-			once = sync.Once{}
+			// Reset singleton so Load() actually runs
+			resetSingleton()
 
-			// Should panic
 			assert.Panics(t, func() {
 				Load()
 			}, "should panic when %s is missing", tt.missing)
@@ -256,23 +255,4 @@ func TestGetRateLimitConfig(t *testing.T) {
 			}
 		})
 	}
-}
-
-// mockEnv implements os environment interface for testing
-type mockEnv struct{}
-
-func (m *mockEnv) Getenv(key string) string {
-	return os.Getenv(key)
-}
-
-func (m *mockEnv) Setenv(key, value string) error {
-	return os.Setenv(key, value)
-}
-
-func (m *mockEnv) Unsetenv(key string) error {
-	return os.Unsetenv(key)
-}
-
-func (m *mockEnv) Environ() []string {
-	return os.Environ()
 }

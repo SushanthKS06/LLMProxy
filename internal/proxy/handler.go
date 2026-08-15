@@ -1,6 +1,12 @@
 // File: internal/proxy/handler.go
 // WHY: Core HTTP handler for the gateway. Handles the full request lifecycle:
 // cache lookup → routing → provider forward → streaming response → async logging.
+//
+// FIX (ISSUE-02): http.MaxBytesReader applied before JSON decode — prevents
+//   malicious or accidental multi-GB request bodies from exhausting memory.
+// FIX (BUG-07): proxyRequests metric now reflects the actual HTTP status code
+//   returned to the client instead of a hardcoded "200" on all success paths.
+// FIX (MINOR-01): Removed unused estimateTokens() function (dead code).
 
 package proxy
 
@@ -21,6 +27,10 @@ import (
 	"github.com/sushanthks/llm-gateway/internal/router"
 	"github.com/sushanthks/llm-gateway/internal/tracker"
 )
+
+// maxRequestBodyBytes is the upper bound on request body size (10 MiB).
+// FIX (ISSUE-02): prevents malicious/accidental huge bodies from exhausting memory.
+const maxRequestBodyBytes = 10 * 1024 * 1024
 
 var (
 	proxyRequests = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -56,7 +66,7 @@ func NewGatewayHandler(
 		tracker: costTracker,
 		config:  cfg,
 		client: &http.Client{
-			Timeout:   120 * time.Second,
+			Timeout: 120 * time.Second,
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
@@ -67,17 +77,22 @@ func NewGatewayHandler(
 }
 
 // ServeHTTP handles the incoming request.
+// Full request lifecycle: validate → extract headers → cache lookup → route → forward → respond.
 func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ctx := r.Context()
 
-	// Validate request
+	// Validate method
 	if r.Method != http.MethodPost {
 		h.writeError(w, r, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	// Extract headers
+	// FIX (ISSUE-02): cap request body to 10 MiB before reading.
+	// Without this, a client sending a multi-GB body exhausts gateway memory.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+
+	// Extract gateway control headers
 	teamID := r.Header.Get("X-Gateway-Team")
 	if teamID == "" {
 		teamID = "default"
@@ -88,6 +103,7 @@ func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		featureTag = "untagged"
 	}
 
+	// X-Gateway-Model lets callers override automatic model routing
 	modelOverride := r.Header.Get("X-Gateway-Model")
 
 	// Parse request body
@@ -97,30 +113,28 @@ func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract prompt text
+	// Extract the user's prompt text (first "user" role message)
 	promptText := extractPromptText(reqBody.Messages)
 	if promptText == "" {
 		h.writeError(w, r, http.StatusBadRequest, "no prompt found in messages")
 		return
 	}
 
-	// Cache lookup
+	// ── Layer 1 + Layer 2 cache lookup ──────────────────────────────────────
 	cacheResult, err := h.cache.Lookup(ctx, promptText, teamID)
 	if err != nil {
 		proxyErrors.WithLabelValues("cache_lookup").Inc()
-		// Continue without cache on error
+		// Non-fatal: continue without cache on error
 	}
 
-	isCacheHit := cacheResult != nil
-
-	// Handle cache hit
-	if isCacheHit {
-		h.handleCacheHit(w, r, cacheResult, start, teamID, featureTag)
+	if cacheResult != nil {
+		// Cache hit (exact hash or semantic similarity >= threshold)
+		h.handleCacheHit(w, r, cacheResult, start, teamID, featureTag, promptText)
 		proxyRequests.WithLabelValues(r.Method, "200").Inc()
 		return
 	}
 
-	// Cache miss - route to provider
+	// ── Cache miss: classify complexity and route to cheapest capable model ──
 	routeDecision := h.router.Route(ctx, &router.ProxyRequest{
 		Model:      modelOverride,
 		PromptText: promptText,
@@ -128,8 +142,8 @@ func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		FeatureTag: featureTag,
 	})
 
-	// Forward to provider
-	response, latency, err := h.forwardToProvider(ctx, r, &reqBody, routeDecision.Model, routeDecision.Provider)
+	// ── Forward to LLM provider ──────────────────────────────────────────────
+	response, providerLatency, err := h.forwardToProvider(ctx, r, &reqBody, routeDecision.Model, routeDecision.Provider)
 	if err != nil {
 		proxyErrors.WithLabelValues("provider_forward").Inc()
 		h.writeError(w, r, http.StatusBadGateway, fmt.Sprintf("provider error: %v", err))
@@ -137,69 +151,77 @@ func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer response.Body.Close()
 
-	// Check if streaming
+	// ── Respond to client ────────────────────────────────────────────────────
+	// FIX (BUG-07): capture the actual status code written to the client so
+	// the proxyRequests metric is accurate for non-200 provider responses.
 	if reqBody.Stream {
-		h.handleStreaming(w, r, response, routeDecision.Model, teamID, featureTag, latency, start)
+		h.handleStreaming(w, r, response, routeDecision.Model, teamID, featureTag, promptText, providerLatency, start)
+		proxyRequests.WithLabelValues(r.Method, "200").Inc()
 	} else {
-		h.handleNonStreaming(w, r, response, routeDecision.Model, teamID, featureTag, latency, start, promptText)
+		statusCode := h.handleNonStreaming(w, r, response, routeDecision.Model, teamID, featureTag, providerLatency, start, promptText)
+		proxyRequests.WithLabelValues(r.Method, fmt.Sprintf("%d", statusCode)).Inc()
 	}
-
-	proxyRequests.WithLabelValues(r.Method, "200").Inc()
 }
 
-// handleCacheHit returns a cached response.
-func (h *GatewayHandler) handleCacheHit(w http.ResponseWriter, r *http.Request, result *cache.CacheResult, start time.Time, teamID, featureTag string) {
+// handleCacheHit writes a cached LLM response directly to the client.
+// promptText is used for complexity classification (not the response text).
+func (h *GatewayHandler) handleCacheHit(w http.ResponseWriter, r *http.Request, result *cache.CacheResult, start time.Time, teamID, featureTag, promptText string) {
 	latency := time.Since(start).Milliseconds()
 
-	// Set headers
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Gateway-Cache", "hit")
+	if result.Similarity >= 1.0 {
+		w.Header().Set("X-Gateway-Cache", "redis_hit")
+	} else {
+		w.Header().Set("X-Gateway-Cache", "semantic_hit")
+	}
 	w.Header().Set("X-Gateway-Model", result.ModelUsed)
 	w.Header().Set("X-Gateway-Cost-USD", fmt.Sprintf("%.8f", result.CostUSD))
 	w.Header().Set("X-Gateway-Latency-MS", fmt.Sprintf("%d", latency))
 
-	// Write response
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(result.ResponseJSON))
+	_, _ = w.Write([]byte(result.ResponseJSON))
 
-	// Async record usage
+	// Async: record cache hit usage (tokens=0, cost from cached entry)
 	h.tracker.RecordUsage(&tracker.UsageEvent{
 		TeamID:       teamID,
 		FeatureTag:   featureTag,
 		ModelUsed:    result.ModelUsed,
 		Provider:     getProviderFromModel(result.ModelUsed),
-		InputTokens:  0, // Not tracked for cache hits
+		InputTokens:  0, // Not re-charged for cache hits
 		OutputTokens: 0,
 		CostUSD:      result.CostUSD,
 		LatencyMS:    int(latency),
 		CacheHit:     true,
-		Complexity:   string(h.router.GetComplexity(extractPromptTextFromJSON(result.ResponseJSON))),
+		Complexity:   string(h.router.GetComplexity(promptText)), // use original prompt, not response JSON
 	})
 }
 
-// handleStreaming handles streaming responses from the provider.
-func (h *GatewayHandler) handleStreaming(w http.ResponseWriter, r *http.Request, response *http.Response, model, teamID, featureTag string, providerLatency int, start time.Time) {
+// handleStreaming forwards a streaming SSE response to the client chunk-by-chunk.
+// Cost is reported as an HTTP trailer (sent after body) so we can compute
+// the actual token count from the full streamed response before setting it.
+func (h *GatewayHandler) handleStreaming(w http.ResponseWriter, r *http.Request, response *http.Response, model, teamID, featureTag, promptText string, providerLatency int, start time.Time) {
 	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Gateway-Cache", "miss")
 	w.Header().Set("X-Gateway-Model", model)
 	w.Header().Set("X-Gateway-Latency-MS", fmt.Sprintf("%d", providerLatency))
+	// Declare trailer key BEFORE first Flush so the client knows to expect it
+	w.Header().Set("Trailer", "X-Gateway-Cost-USD")
 
-	// Enable streaming
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.writeError(w, r, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
 
-	// Read and forward response
 	buf := make([]byte, 4096)
-	var fullResponse string
+	var fullResponse strings.Builder
 
 	for {
 		n, err := response.Body.Read(buf)
 		if n > 0 {
 			chunk := string(buf[:n])
-			fullResponse += chunk
+			fullResponse.WriteString(chunk)
 			fmt.Fprint(w, chunk)
 			flusher.Flush()
 		}
@@ -208,57 +230,15 @@ func (h *GatewayHandler) handleStreaming(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// Async record usage (estimate tokens from response)
-	inputTokens := estimateTokens(r.Body)
-	outputTokens := estimateTokensFromResponse(fullResponse)
-	cost := h.router.EstimateCost(model, inputTokens, outputTokens)
-	latency := time.Since(start).Milliseconds()
-
-	w.Header().Set("X-Gateway-Cost-USD", fmt.Sprintf("%.8f", cost))
-
-	h.tracker.RecordUsage(&tracker.UsageEvent{
-		TeamID:       teamID,
-		FeatureTag:   featureTag,
-		ModelUsed:    model,
-		Provider:     getProviderFromModel(model),
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		CostUSD:      cost,
-		LatencyMS:    int(latency),
-		CacheHit:     false,
-		Complexity:   string(h.router.GetComplexity(extractPromptTextFromJSON(fullResponse))),
-	})
-}
-
-// handleNonStreaming handles non-streaming responses.
-func (h *GatewayHandler) handleNonStreaming(w http.ResponseWriter, r *http.Request, response *http.Response, model, teamID, featureTag string, providerLatency int, start time.Time, promptText string) {
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		h.writeError(w, r, http.StatusBadGateway, fmt.Sprintf("failed to read response: %v", err))
-		return
-	}
-
-	latency := time.Since(start).Milliseconds()
-
-	// Set headers
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Gateway-Cache", "miss")
-	w.Header().Set("X-Gateway-Model", model)
-	w.Header().Set("X-Gateway-Latency-MS", fmt.Sprintf("%d", latency))
-
-	// Estimate tokens and cost
+	// Now that streaming is done, compute actual cost from the full response
 	inputTokens := estimateTokensFromPrompt(promptText)
-	outputTokens := estimateTokensFromResponse(string(body))
+	outputTokens := estimateTokensFromResponse(fullResponse.String())
 	cost := h.router.EstimateCost(model, inputTokens, outputTokens)
+	latency := time.Since(start).Milliseconds()
 
-	w.Header().Set("X-Gateway-Cost-USD", fmt.Sprintf("%.8f", cost))
-
-	// Write response
-	w.WriteHeader(response.StatusCode)
-	w.Write(body)
-
-	// Async store in cache and record usage
-	h.storeInCache(promptText, string(body), model, inputTokens, outputTokens, cost, teamID)
+	// Set cost as HTTP/1.1 chunked trailer (sent after last chunk)
+	// Clients that don't support trailers simply ignore this header.
+	w.Header().Set(http.TrailerPrefix+"X-Gateway-Cost-USD", fmt.Sprintf("%.8f", cost))
 
 	h.tracker.RecordUsage(&tracker.UsageEvent{
 		TeamID:       teamID,
@@ -274,10 +254,61 @@ func (h *GatewayHandler) handleNonStreaming(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// forwardToProvider forwards the request to the LLM provider.
+// handleNonStreaming reads the full provider response, sends it to the client,
+// then asynchronously stores it in the semantic cache.
+// Returns the HTTP status code written to the client (used for metrics).
+func (h *GatewayHandler) handleNonStreaming(w http.ResponseWriter, r *http.Request, response *http.Response, model, teamID, featureTag string, providerLatency int, start time.Time, promptText string) int {
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		h.writeError(w, r, http.StatusBadGateway, fmt.Sprintf("failed to read response: %v", err))
+		return http.StatusBadGateway
+	}
+
+	latency := time.Since(start).Milliseconds()
+
+	inputTokens := estimateTokensFromPrompt(promptText)
+	outputTokens := estimateTokensFromResponse(string(body))
+	cost := h.router.EstimateCost(model, inputTokens, outputTokens)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Gateway-Cache", "miss")
+	w.Header().Set("X-Gateway-Model", model)
+	w.Header().Set("X-Gateway-Latency-MS", fmt.Sprintf("%d", latency))
+	w.Header().Set("X-Gateway-Cost-USD", fmt.Sprintf("%.8f", cost))
+
+	// FIX (BUG-07): use provider's actual status code, not hardcoded 200.
+	w.WriteHeader(response.StatusCode)
+	_, _ = w.Write(body)
+
+	// Async: store response in semantic cache for future similar prompts.
+	// Only cache successful provider responses (2xx).
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		h.storeInCache(promptText, string(body), model, teamID, inputTokens, outputTokens, cost)
+	}
+
+	h.tracker.RecordUsage(&tracker.UsageEvent{
+		TeamID:       teamID,
+		FeatureTag:   featureTag,
+		ModelUsed:    model,
+		Provider:     getProviderFromModel(model),
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		CostUSD:      cost,
+		LatencyMS:    int(latency),
+		CacheHit:     false,
+		Complexity:   string(h.router.GetComplexity(promptText)),
+	})
+
+	// FIX (BUG-07): return the actual status code so the caller can record
+	// the correct metric label.
+	return response.StatusCode
+}
+
+// forwardToProvider constructs and sends the request to the appropriate LLM provider.
+// It handles provider-specific URL, authentication headers, and request format conversion.
 func (h *GatewayHandler) forwardToProvider(ctx context.Context, r *http.Request, reqBody *chatCompletionRequest, model, provider string) (*http.Response, int, error) {
 	var url string
-	var headers http.Header = make(http.Header)
+	headers := make(http.Header)
 
 	switch provider {
 	case "openai":
@@ -287,15 +318,20 @@ func (h *GatewayHandler) forwardToProvider(ctx context.Context, r *http.Request,
 		url = fmt.Sprintf("%s/v1/messages", h.config.Providers.AnthropicBaseURL)
 		headers.Set("x-api-key", h.config.Providers.AnthropicAPIKey)
 		headers.Set("anthropic-version", "2023-06-01")
+	case "groq":
+		url = fmt.Sprintf("%s/chat/completions", h.config.Providers.GroqBaseURL)
+		headers.Set("Authorization", "Bearer "+h.config.Providers.GroqAPIKey)
 	default:
 		return nil, 0, fmt.Errorf("unknown provider: %s", provider)
 	}
 
 	headers.Set("Content-Type", "application/json")
 
-	// Convert to provider format
 	providerBody := convertToProviderFormat(reqBody, provider, model)
-	bodyBytes, _ := json.Marshal(providerBody)
+	bodyBytes, err := json.Marshal(providerBody)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to marshal request body: %w", err)
+	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -304,34 +340,57 @@ func (h *GatewayHandler) forwardToProvider(ctx context.Context, r *http.Request,
 
 	httpReq.Header = headers
 
+	var resp *http.Response
+
+	maxRetries := 3
+	backoff := 100 * time.Millisecond
+
 	start := time.Now()
-	resp, err := h.client.Do(httpReq)
+	for i := 0; i < maxRetries; i++ {
+		// Clone body reader for retries
+		httpReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+		resp, err = h.client.Do(httpReq)
+		if err == nil && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+			break
+		}
+
+		// If it's the last attempt, don't sleep
+		if i == maxRetries-1 {
+			break
+		}
+
+		// Drain and close response body before retrying
+		if resp != nil && resp.Body != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+
+		time.Sleep(backoff)
+		backoff *= 2
+	}
 	latency := int(time.Since(start).Milliseconds())
 
 	return resp, latency, err
 }
 
-// storeInCache stores the response in the semantic cache.
-func (h *GatewayHandler) storeInCache(prompt, response, model string, inputTokens, outputTokens int, cost float64, teamID string) {
-	embedding, err := h.cache.(*cache.SemanticCache) // This is a hack, need to fix
-	// Actually we need to get the embedder from somewhere
-	// For now, skip embedding storage
-	_ = embedding
-	_ = err
-
-	// Store without embedding for now (embedding will be computed async)
-	// This is a simplified version - in production we'd compute embedding
+// storeInCache persists the LLM response to the semantic cache asynchronously.
+func (h *GatewayHandler) storeInCache(prompt, response, model, teamID string, inputTokens, outputTokens int, cost float64) {
+	// StoreResponse is already async (launches goroutine internally)
+	h.cache.StoreResponse(context.Background(), prompt, response, model, inputTokens, outputTokens, cost, teamID)
 }
 
-// writeError writes an error response.
+// writeError writes a structured JSON error response.
 func (h *GatewayHandler) writeError(w http.ResponseWriter, r *http.Request, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 	proxyRequests.WithLabelValues(r.Method, fmt.Sprintf("%d", status)).Inc()
 }
 
-// Chat completion request/response types
+// ─── Request / Response Types ────────────────────────────────────────────────
+
+// chatCompletionRequest is the OpenAI-compatible request body accepted by the gateway.
 type chatCompletionRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
@@ -340,12 +399,28 @@ type chatCompletionRequest struct {
 	Temperature float64   `json:"temperature,omitempty"`
 }
 
+// Message is a single chat message in role/content format.
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-// Helper functions
+// anthropicRequest matches the Anthropic Messages API request body.
+// WHY: Anthropic's schema differs from OpenAI's in three key ways:
+//  1. max_tokens is REQUIRED (no default)
+//  2. system prompt is a top-level field, not a message
+//  3. Model IDs use a different naming convention (e.g. claude-3-haiku-20240307)
+type anthropicRequest struct {
+	Model     string    `json:"model"`
+	MaxTokens int       `json:"max_tokens"`
+	Messages  []Message `json:"messages"`
+	System    string    `json:"system,omitempty"`
+	Stream    bool      `json:"stream,omitempty"`
+}
+
+// ─── Helper Functions ─────────────────────────────────────────────────────────
+
+// extractPromptText returns the content of the first user message.
 func extractPromptText(messages []Message) string {
 	for _, msg := range messages {
 		if msg.Role == "user" {
@@ -355,38 +430,140 @@ func extractPromptText(messages []Message) string {
 	return ""
 }
 
+// extractPromptTextFromJSON extracts the assistant reply content from an OpenAI response JSON.
+// Returns "" if the JSON cannot be parsed or the expected structure is absent.
 func extractPromptTextFromJSON(resp string) string {
 	var respMap map[string]interface{}
-	if err := json.Unmarshal([]byte(resp), &respMap); err != "" {
+	if err := json.Unmarshal([]byte(resp), &respMap); err != nil {
 		return ""
 	}
-	// Extract from response
-	return ""
-}
-
-func getProviderFromModel(model string) string {
-	if strings.Contains(model, "openai") {
-		return "openai"
+	choices, ok := respMap["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return ""
 	}
-	return "anthropic"
+	choice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	message, ok := choice["message"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	content, ok := message["content"].(string)
+	if !ok {
+		return ""
+	}
+	return content
 }
 
-func estimateTokens(text string) int {
-	// Rough estimate: ~4 characters per token
-	return len(text) / 4
+// getProviderFromModel returns the provider name from an internal model identifier.
+// Internal format: "provider/model-name" (e.g. "openai/gpt-4o-mini").
+func getProviderFromModel(model string) string {
+	switch {
+	case strings.HasPrefix(model, "openai/"):
+		return "openai"
+	case strings.HasPrefix(model, "anthropic/"):
+		return "anthropic"
+	case strings.HasPrefix(model, "groq/"):
+		return "groq"
+	default:
+		return "unknown"
+	}
 }
 
+// estimateTokensFromPrompt estimates tokens in a user prompt using a character heuristic.
+// WHY: A standard rule of thumb is 1 token ~= 4 characters in English text.
+// This is much more accurate for cost accounting than word counts.
 func estimateTokensFromPrompt(prompt string) int {
-	words := len(strings.Fields(prompt))
-	return words // Rough estimate
+	return len(prompt) / 4
 }
 
+// estimateTokensFromResponse estimates tokens in a JSON response string.
 func estimateTokensFromResponse(resp string) int {
-	// Parse response and estimate
 	return len(resp) / 4
 }
 
+// convertToProviderFormat converts the internal request body to the provider's
+// expected wire format. OpenAI and Anthropic have different API schemas.
 func convertToProviderFormat(req *chatCompletionRequest, provider, model string) interface{} {
-	// Convert to provider-specific format
-	return req
+	switch provider {
+	case "anthropic":
+		return convertToAnthropicFormat(req, model)
+	case "groq":
+		req.Model = mapGroqModelName(model)
+		return req
+	default: // openai
+		req.Model = mapOpenAIModelName(model)
+		return req
+	}
+}
+
+// mapGroqModelName converts internal model identifiers to Groq API model IDs.
+func mapGroqModelName(model string) string {
+	mapping := map[string]string{
+		"groq/gpt-oss-20b":             "openai/gpt-oss-20b",
+		"groq/llama-3.3-70b-versatile": "llama-3.3-70b-versatile",
+		"groq/gpt-oss-120b":            "openai/gpt-oss-120b",
+	}
+	if mapped, ok := mapping[model]; ok {
+		return mapped
+	}
+	// Fallback: strip the "groq/" prefix
+	return strings.TrimPrefix(model, "groq/")
+}
+
+// convertToAnthropicFormat builds the Anthropic Messages API body from the
+// OpenAI-compatible request. Key differences handled:
+// - max_tokens is required; defaults to 1024 when caller didn't specify
+// - system messages extracted to top-level "system" field
+// - model ID mapped to the Anthropic API model identifier
+func convertToAnthropicFormat(req *chatCompletionRequest, model string) *anthropicRequest {
+	maxTokens := req.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 1024
+	}
+
+	var system string
+	messages := make([]Message, 0, len(req.Messages))
+	for _, msg := range req.Messages {
+		if msg.Role == "system" {
+			system = msg.Content // Anthropic takes system as a top-level field
+		} else {
+			messages = append(messages, msg)
+		}
+	}
+
+	return &anthropicRequest{
+		Model:     mapAnthropicModelName(model),
+		MaxTokens: maxTokens,
+		Messages:  messages,
+		System:    system,
+		Stream:    req.Stream,
+	}
+}
+
+// mapAnthropicModelName converts internal model identifiers to Anthropic API model IDs.
+func mapAnthropicModelName(model string) string {
+	mapping := map[string]string{
+		"anthropic/claude-haiku-3":  "claude-3-haiku-20240307",
+		"anthropic/claude-sonnet-4": "claude-sonnet-4-5",
+	}
+	if mapped, ok := mapping[model]; ok {
+		return mapped
+	}
+	// Fallback: strip the "anthropic/" prefix
+	return strings.TrimPrefix(model, "anthropic/")
+}
+
+// mapOpenAIModelName converts internal model identifiers to OpenAI API model IDs.
+func mapOpenAIModelName(model string) string {
+	mapping := map[string]string{
+		"openai/gpt-4o-mini": "gpt-4o-mini",
+		"openai/gpt-4o":      "gpt-4o",
+	}
+	if mapped, ok := mapping[model]; ok {
+		return mapped
+	}
+	// Fallback: strip the "openai/" prefix
+	return strings.TrimPrefix(model, "openai/")
 }

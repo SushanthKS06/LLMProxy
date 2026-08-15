@@ -8,19 +8,27 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 
 -- Prompt cache table for semantic caching
+-- FIX (ISSUE-10): response_json changed from JSONB → TEXT.
+--   Rationale: the value is already serialized JSON string; no JSON operators
+--   (->>, @>, etc.) are ever used on this column.  JSONB causes silent INSERT
+--   failures when the LLM returns malformed / partial JSON on error paths.
+-- FIX (ISSUE-04): UNIQUE(prompt_hash, team_id) prevents duplicate rows when
+--   two concurrent cache-miss requests race to store the same prompt.
 CREATE TABLE IF NOT EXISTS prompt_cache (
-    id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    prompt_hash   TEXT        NOT NULL,
-    prompt_text   TEXT        NOT NULL,
-    embedding     vector(1536) NOT NULL,
-    response_json JSONB       NOT NULL,
-    model_used    TEXT        NOT NULL,
-    input_tokens  INT         NOT NULL CHECK (input_tokens >= 0),
-    output_tokens INT         NOT NULL CHECK (output_tokens >= 0),
+    id            UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+    prompt_hash   TEXT          NOT NULL,
+    prompt_text   TEXT          NOT NULL,
+    embedding     vector(768)  NOT NULL,
+    response_json TEXT          NOT NULL,
+    model_used    TEXT          NOT NULL,
+    input_tokens  INT           NOT NULL CHECK (input_tokens >= 0),
+    output_tokens INT           NOT NULL CHECK (output_tokens >= 0),
     cost_usd      NUMERIC(10,8) NOT NULL CHECK (cost_usd >= 0),
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    hit_count     INT         NOT NULL DEFAULT 0,
-    team_id       TEXT        NOT NULL DEFAULT 'default'
+    created_at    TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    hit_count     INT           NOT NULL DEFAULT 0,
+    team_id       TEXT          NOT NULL DEFAULT 'default',
+
+    CONSTRAINT prompt_cache_unique_prompt_per_team UNIQUE (prompt_hash, team_id)
 );
 
 -- IVFFlat index for approximate nearest neighbor search.

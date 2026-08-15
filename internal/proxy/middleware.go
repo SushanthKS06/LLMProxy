@@ -1,10 +1,17 @@
 // File: internal/proxy/middleware.go
 // WHY: Middleware for rate limiting, authentication, logging, and CORS.
+//
+// FIX (MINOR-02): Removed hand-rolled min() function which shadows the
+//   built-in min() available since Go 1.21 (this module targets Go 1.22).
+// FIX (ISSUE-06): AuthMiddleware now logs the SHA-256 hash of the invalid
+//   API key instead of its raw prefix — the prefix can be used to narrow a
+//   brute-force attack on short static keys.
 
 package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/time/rate"
 )
 
@@ -107,8 +115,15 @@ func (rl *RequestLogger) Log(next http.Handler) http.Handler {
 			featureTag = "untagged"
 		}
 
+		reqID := r.Header.Get("X-Request-ID")
+		if reqID == "" {
+			reqID = uuid.New().String()
+		}
+		w.Header().Set("X-Request-ID", reqID)
+
 		rl.logger.Info("request",
 			"time", start.Format(time.RFC3339),
+			"request_id", reqID,
 			"method", r.Method,
 			"path", r.URL.Path,
 			"team_id", teamID,
@@ -186,12 +201,14 @@ func (cm *CORSMiddleware) CORS(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", strings.Join(cm.allowedOrigins, ","))
 			w.Header().Set("Access-Control-Allow-Methods", strings.Join(cm.allowedMethods, ","))
 			w.Header().Set("Access-Control-Allow-Headers", strings.Join(cm.allowedHeaders, ","))
+			w.Header().Set("Access-Control-Expose-Headers", "X-Gateway-Cache, X-Gateway-Model")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Gateway-Cache, X-Gateway-Model")
 
 		next.ServeHTTP(w, r)
 	})
@@ -216,10 +233,19 @@ func NewAuthMiddleware(apiKeys []string, logger *slog.Logger) *AuthMiddleware {
 }
 
 // Auth returns a middleware that validates API keys.
+// WHY: When GATEWAY_API_KEYS is not set, the gateway runs in open mode (no auth).
+// This allows local development without configuring keys. In production, always
+// set GATEWAY_API_KEYS to a non-empty value.
 func (am *AuthMiddleware) Auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip auth for health check
 		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Open mode: no API keys configured — allow all (useful for local dev)
+		if len(am.validKeys) == 0 {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -232,7 +258,13 @@ func (am *AuthMiddleware) Auth(next http.Handler) http.Handler {
 
 		if apiKey == "" || !am.validKeys[apiKey] {
 			if apiKey != "" {
-				am.logger.Warn("invalid API key", "key", apiKey[:min(len(apiKey), 8)]+"...")
+				// FIX (ISSUE-06): log the SHA-256 hash of the key, not its raw prefix.
+				// A raw prefix narrows brute-force search space for short static keys;
+				// a hash of the full key leaks nothing actionable.
+				h := sha256.Sum256([]byte(apiKey))
+				am.logger.Warn("invalid API key",
+					"key_sha256_prefix", fmt.Sprintf("%x", h[:4]),
+				)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -244,14 +276,8 @@ func (am *AuthMiddleware) Auth(next http.Handler) http.Handler {
 	})
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // Chain applies multiple middleware in order.
+// The first middleware in the list is the outermost (executes first).
 func Chain(h http.Handler, middlewares ...func(http.Handler) http.Handler) http.Handler {
 	for i := len(middlewares) - 1; i >= 0; i-- {
 		h = middlewares[i](h)

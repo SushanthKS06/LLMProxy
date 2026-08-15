@@ -6,22 +6,22 @@ import (
 	"context"
 	"testing"
 
-	"github.com/sushanthks/llm-gateway/internal/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/sushanthks/llm-gateway/internal/config"
 )
 
 func TestModelRouter_Route(t *testing.T) {
 	cfg := &config.Config{
 		Routing: config.RoutingConfig{
-			DefaultModel:         "anthropic/claude-haiku-3",
-			SimilarityThreshold:  0.92,
-			SimpleTokenThreshold: 50,
+			DefaultModel:          "anthropic/claude-haiku-3",
+			SimilarityThreshold:   0.92,
+			SimpleTokenThreshold:  50,
 			ComplexTokenThreshold: 300,
 		},
 		Cost: map[string]config.ModelCost{
-			"openai/gpt-4o-mini":       {InputPer1M: 0.15, OutputPer1M: 0.60},
-			"anthropic/claude-haiku-3": {InputPer1M: 0.25, OutputPer1M: 1.25},
-			"anthropic/claude-sonnet-4": {InputPer1M: 3.00, OutputPer1M: 15.00},
+			"groq/gpt-oss-20b":          {InputPer1M: 0.075, OutputPer1M: 0.30},
+			"groq/llama-3.3-70b-versatile": {InputPer1M: 0.59, OutputPer1M: 0.79},
+			"groq/gpt-oss-120b":         {InputPer1M: 0.15, OutputPer1M: 0.60},
 		},
 	}
 
@@ -33,19 +33,19 @@ func TestModelRouter_Route(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "simple prompt routes to gpt-4o-mini",
+			name:     "simple prompt routes to groq/gpt-oss-20b",
 			prompt:   "What is 2+2?",
-			expected: "openai/gpt-4o-mini",
+			expected: "groq/gpt-oss-20b",
 		},
 		{
-			name:     "medium prompt routes to claude-haiku-3",
+			name:     "medium prompt routes to groq/llama-3.3-70b-versatile",
 			prompt:   "Explain what a REST API is in simple terms.",
-			expected: "anthropic/claude-haiku-3",
+			expected: "groq/llama-3.3-70b-versatile",
 		},
 		{
-			name:     "complex prompt routes to claude-sonnet-4",
+			name:     "complex prompt routes to groq/gpt-oss-120b",
 			prompt:   "Compare and contrast the pros and cons of microservices vs monolithic architecture. Analyze the performance implications and scalability characteristics.",
-			expected: "anthropic/claude-sonnet-4",
+			expected: "groq/gpt-oss-120b",
 		},
 	}
 
@@ -99,13 +99,15 @@ func TestModelRouter_EstimateCost(t *testing.T) {
 
 func TestGetProvider(t *testing.T) {
 	tests := []struct {
-		model     string
-		expected  string
+		model    string
+		expected string
 	}{
 		{"openai/gpt-4o", "openai"},
 		{"openai/gpt-4o-mini", "openai"},
 		{"anthropic/claude-haiku-3", "anthropic"},
 		{"anthropic/claude-sonnet-4", "anthropic"},
+		{"groq/gpt-oss-120b", "groq"},
+		{"groq/llama-3.3-70b-versatile", "groq"},
 	}
 
 	for _, tt := range tests {

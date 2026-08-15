@@ -2,6 +2,10 @@
 // WHY: Redis is used as a hot cache layer alongside pgvector for sub-5ms lookups.
 // The 2-layer cache architecture: Redis stores exact prompt_hash lookups (<1ms),
 // while pgvector handles semantic similarity search for cache misses.
+//
+// FIX (MINOR-04): Removed the unused RedisClient wrapper struct and NewRedis()
+//   constructor. main.go calls NewRedisClient() directly; the wrapper was dead
+//   code that added confusion and an unnecessary indirection layer.
 
 package db
 
@@ -14,51 +18,30 @@ import (
 	"github.com/sushanthks/llm-gateway/internal/config"
 )
 
-// NewRedisClient creates a new Redis client.
+// NewRedisClient creates a new Redis client with production-ready defaults.
 func NewRedisClient(cfg *config.DatabaseConfig) *redis.Client {
 	rdb := redis.NewClient(&redis.Options{
-		Addr:         cfg.RedisAddr,
-		Password:     cfg.RedisPassword,
-		DB:           cfg.RedisDB,
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
-		PoolSize:     10,
-		MinIdleConns: 2,
-		MaxRetries:   3,
-		RetryDelay:   100 * time.Millisecond,
+		Addr:            cfg.RedisAddr,
+		Password:        cfg.RedisPassword,
+		DB:              cfg.RedisDB,
+		DialTimeout:     5 * time.Second,
+		ReadTimeout:     3 * time.Second,
+		WriteTimeout:    3 * time.Second,
+		PoolSize:        10,
+		MinIdleConns:    2,
+		MaxRetries:      3,
+		MinRetryBackoff: 100 * time.Millisecond,
+		MaxRetryBackoff: 512 * time.Millisecond,
 	})
 	return rdb
 }
 
-// HealthCheck verifies the Redis connection is healthy.
-func HealthCheck(ctx context.Context, rdb *redis.Client) error {
+// RedisHealthCheck verifies the Redis client connection is healthy.
+func RedisHealthCheck(ctx context.Context, rdb *redis.Client) error {
 	if rdb == nil {
 		return fmt.Errorf("redis client is nil")
 	}
 	return rdb.Ping(ctx).Err()
-}
-
-// RedisClient wraps redis.Client for convenience methods.
-type RedisClient struct {
-	client *redis.Client
-}
-
-// NewRedis creates a new RedisClient wrapper.
-func NewRedis(cfg *config.DatabaseConfig) *RedisClient {
-	return &RedisClient{
-		client: NewRedisClient(cfg),
-	}
-}
-
-// Get returns the underlying redis client.
-func (r *RedisClient) Get() *redis.Client {
-	return r.client
-}
-
-// Close closes the Redis connection.
-func (r *RedisClient) Close() error {
-	return r.client.Close()
 }
 
 // Get retrieves a value from Redis by key.

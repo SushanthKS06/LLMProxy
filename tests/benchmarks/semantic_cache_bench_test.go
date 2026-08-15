@@ -7,7 +7,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/sushanthks/llm-gateway/internal/cache"
 	"github.com/sushanthks/llm-gateway/internal/config"
 )
 
