@@ -7,8 +7,8 @@ from sqlalchemy import text
 from datetime import datetime, timedelta
 from typing import Optional
 
-from database import get_db
-from models.schemas import CostSummary, CostByDay, CostBreakdownItem
+from ..database import get_db
+from ..models.schemas import CostSummary, CostByDay, CostBreakdownItem
 
 router = APIRouter(prefix="/api/v1/costs", tags=["costs"])
 
@@ -76,9 +76,9 @@ async def get_cost_summary(
     # Get savings from cache
     cache_savings_result = await db.execute(
         text("""
-            SELECT COALESCE(SUM(cost_usd), 0) as savings
+            SELECT COALESCE(SUM(cost_saved_usd), 0) as savings
             FROM usage_log
-            WHERE team_id = :team_id AND created_at >= :since AND cache_hit = true
+            WHERE team_id = :team_id AND created_at >= :since
         """),
         {"team_id": team_id, "since": since}
     )
@@ -93,7 +93,7 @@ async def get_cost_summary(
         cost_by_model=cost_by_model,
         cost_by_feature=cost_by_feature,
         cost_by_day=cost_by_day,
-        savings_from_cache_usd=savings,
+        total_cost_saved_usd=savings,
         projected_monthly_cost=projected_monthly,
     )
 

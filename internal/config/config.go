@@ -108,6 +108,17 @@ func Load() *Config {
 	return cfg
 }
 
+// Reset clears the config singleton so that Load() can be called again.
+// THIS FUNCTION IS INTENDED FOR USE IN TESTS ONLY.
+// Calling it in production code is a bug — the singleton exists to guarantee
+// a single consistent config for the lifetime of the process.
+//
+//nolint:unused // used in test packages
+func Reset() {
+	once = sync.Once{}
+	cfg = nil
+}
+
 // loadConfig performs the actual configuration loading.
 func loadConfig() *Config {
 	// Required fields - panic if missing
@@ -117,12 +128,6 @@ func loadConfig() *Config {
 	postgresDSN := getEnv("POSTGRES_DSN", "")
 	redisAddr := getEnv("REDIS_ADDR", "")
 
-	if openAIKey == "" {
-		panic("OPENAI_API_KEY is required")
-	}
-	if anthropicKey == "" {
-		panic("ANTHROPIC_API_KEY is required")
-	}
 	if groqKey == "" {
 		panic("GROQ_API_KEY is required")
 	}
@@ -297,4 +302,26 @@ func GetRateLimitConfig() (rps int, burst int, err error) {
 		return 0, 0, fmt.Errorf("GATEWAY_RATE_LIMIT_BURST must be positive, got %d", burst)
 	}
 	return rps, burst, nil
+}
+
+// GetAllowedOrigins returns the list of allowed CORS origins from environment.
+// FIX (AUDIT-J): Wires GATEWAY_ALLOWED_ORIGINS to CORSMiddleware so production
+// deployments can restrict cross-origin access to known frontend domains.
+// Defaults to ["*"] (open) for local development; always set this in production.
+func GetAllowedOrigins() []string {
+	originsStr := getEnv("GATEWAY_ALLOWED_ORIGINS", "")
+	if originsStr == "" {
+		return []string{"*"}
+	}
+	var origins []string
+	for _, o := range strings.Split(originsStr, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			origins = append(origins, o)
+		}
+	}
+	if len(origins) == 0 {
+		return []string{"*"}
+	}
+	return origins
 }

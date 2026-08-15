@@ -182,12 +182,14 @@ func (sc *SemanticCache) Lookup(ctx context.Context, prompt string, teamID strin
 
 // semanticSearch performs pgvector cosine-similarity search.
 func (sc *SemanticCache) semanticSearch(ctx context.Context, embedding []float32, teamID string) (*CacheResult, error) {
+	// FIX (P2-3): LIMIT changed from 5 → 1. The caller only reads the first row;
+	// fetching 5 rows wastes DB I/O and network bandwidth on every semantic search.
 	query := `
 		SELECT id::text, response_json, model_used, cost_usd, 1 - (embedding <=> $1) as similarity
 		FROM prompt_cache
 		WHERE team_id = $2
 		ORDER BY embedding <=> $1
-		LIMIT 5
+		LIMIT 1
 	`
 
 	vector := pgvector.NewVector(embedding)
@@ -340,8 +342,11 @@ func (sc *SemanticCache) StoreResponse(ctx context.Context, promptText, response
 }
 
 // incrementHitCount increments the hit count for a cached entry (best-effort).
+// FIX (P2-4): Use native UUID comparison ($1::uuid) instead of id::text = $1.
+// Casting every stored UUID to TEXT on the right side makes the primary key
+// index unusable, causing a full sequential scan on every cache hit.
 func (sc *SemanticCache) incrementHitCount(ctx context.Context, cacheID string) {
-	query := `UPDATE prompt_cache SET hit_count = hit_count + 1 WHERE id::text = $1`
+	query := `UPDATE prompt_cache SET hit_count = hit_count + 1 WHERE id = $1::uuid`
 	_, err := sc.pool.Exec(ctx, query, cacheID)
 	if err != nil {
 		// FIX (ISSUE-08): structured log instead of fmt.Printf
